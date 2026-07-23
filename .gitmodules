@@ -1,0 +1,3 @@
+[submodule "external/mtp-lm"]
+	path = external/mtp-lm
+	url = git@github.com:Po-WeiHuang/mtp-lm.git
