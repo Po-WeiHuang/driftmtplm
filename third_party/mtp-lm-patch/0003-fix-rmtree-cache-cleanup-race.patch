@@ -1,0 +1,26 @@
+diff --git a/litgpt/p2p_tokenizer.py b/litgpt/p2p_tokenizer.py
+index 61ed6a6..7e39a29 100644
+--- a/litgpt/p2p_tokenizer.py
++++ b/litgpt/p2p_tokenizer.py
+@@ -535,7 +535,7 @@ def parquet_to_parquet_tokenization(
+             print("Removing tok cache on rank 0...")
+             import shutil
+
+-            shutil.rmtree(cache_dir, ignore_errors=False)
++            shutil.rmtree(cache_dir, ignore_errors=True)
+             print("tok cache removed.")
+
+     print(f"Task {array_task_id} finished tokenization.")
+diff --git a/litgpt/pull_raw_datasets.py b/litgpt/pull_raw_datasets.py
+index 54cfa5d..1b8f0c2 100644
+--- a/litgpt/pull_raw_datasets.py
++++ b/litgpt/pull_raw_datasets.py
+@@ -351,7 +351,7 @@ def pull_raw_datasets(
+             print("Removing pull cache on rank 0...")
+             import shutil
+
+-            shutil.rmtree(cache_dir, ignore_errors=False)
++            shutil.rmtree(cache_dir, ignore_errors=True)
+             print("pull cache removed.")
+
+     print(f"Task {array_task_id} finished data pull.")
