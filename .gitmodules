@@ -1,0 +1,6 @@
+[submodule "third_party/mtp-lm"]
+	path = third_party/mtp-lm
+	url = git@github.com:Po-WeiHuang/mtp-lm.git
+[submodule "third_party/attention-gym"]
+	path = third_party/attention-gym
+	url = https://github.com/meta-pytorch/attention-gym.git

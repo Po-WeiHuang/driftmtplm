@@ -1,0 +1,26 @@
+diff --git a/litgpt/p2p_tokenizer.py b/litgpt/p2p_tokenizer.py
+index 5cbd110..be6911b 100644
+--- a/litgpt/p2p_tokenizer.py
++++ b/litgpt/p2p_tokenizer.py
+@@ -25,7 +25,7 @@ from jsonargparse import CLI, set_parsing_settings
+ from args_data import DataSource, DataSources, P2PConfig
+ 
+ import torch.distributed as dist
+-from torch.distributed import timedelta
++from datetime import timedelta
+ 
+ 
+ def is_valid_parquet_file(file_path):
+diff --git a/litgpt/pull_raw_datasets.py b/litgpt/pull_raw_datasets.py
+index 13dd880..62391e3 100644
+--- a/litgpt/pull_raw_datasets.py
++++ b/litgpt/pull_raw_datasets.py
+@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
+ from args_data import DataSource, DataSources, P2PConfig
+ 
+ import torch.distributed as dist
+-from torch.distributed import timedelta
++from datetime import timedelta
+ 
+ 
+ def extract_text_field(dataset, text_field="text", tokenizer=None, num_proc=None):
