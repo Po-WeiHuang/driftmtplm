@@ -81,4 +81,4 @@ cd /home/exet5937/aiproj/driftmtplm/third_party/mtp-lm
 ####################################################
 
 srun python -u litgpt/pretrain.py \
-    --config=../mtp-lm-patch/config_hub/pretrain/reproduce_full.yaml
+    --config=/home/exet5937/aiproj/driftmtplm/third_party/mtp-lm-patch/config_hub/pretrain/reproduce_full.yaml
