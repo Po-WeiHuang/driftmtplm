@@ -1,0 +1,18 @@
+/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/args.py:97: UserWarning: `--train.lr_warmup_steps` should be less than `--train.max_steps`. Got 2000 lr_warmup_steps and 2 max_steps.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 2750, in <module>
+    CLI(setup)
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 27, in CLI
+    return auto_cli(*args, _stacklevel=3, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 106, in auto_cli
+    return _run_component(components, init)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 227, in _run_component
+    return component(**cfg)
+           ^^^^^^^^^^^^^^^^
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 590, in setup
+    assert logger_name == "wandb", "Only supporting wandb logging."
+           ^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Only supporting wandb logging.

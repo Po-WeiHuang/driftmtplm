@@ -1,0 +1,197 @@
+Initializing distributed: GLOBAL_RANK: 0, MEMBER: 1/1
+----------------------------------------------------------------------------------------------------
+distributed_backend=nccl
+All distributed processes registered. Starting with 1 processes
+----------------------------------------------------------------------------------------------------
+
+wandb: WARNING `resume` will be ignored since W&B syncing is set to `offline`. Starting a new run with run id 3xpi285y.
+wandb: Tracking run with wandb version 0.23.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/smoke_test/wandb/offline-run-20260813_202154-3xpi285y
+[rank: 0] Seed set to 42
+/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/lightning/fabric/plugins/precision/fsdp.py:89: FSDP with `bf16-true` enables computation in lower precision. FSDP will always retain a full-precision copy of the model parameters for sharding.
+/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/distributed/fsdp/_init_utils.py:430: UserWarning: FSDP is switching to use `NO_SHARD` instead of ShardingStrategy.HYBRID_SHARD since the world size is 1.
+  warnings.warn(
+INFO:litgpt.parquet_dataset:Rank 0/1 has 32 parquet files | identifier=34409af1
+INFO:litgpt.parquet_dataset:Example 0: [128000, 128006, 882, 128007, 271, 2746, 18984, 31094, 264, 2860, 315, 220]
+INFO:litgpt.parquet_dataset:Example 1: [128000, 128006, 882, 128007, 271, 95394, 8458, 5900, 12185, 2391, 264, 6412]
+INFO:litgpt.parquet_dataset:Example 2: [128000, 128006, 882, 128007, 271, 644, 813, 1176, 3280, 520, 7252, 41342]
+INFO:litgpt.parquet_dataset:Rank 0/1 has 32 parquet files | identifier=e5e4cee1
+INFO:litgpt.parquet_dataset:Example 0: [128000, 128006, 882, 128007, 271, 2746, 1070, 1051, 15453, 220, 1272, 26993]
+INFO:litgpt.parquet_dataset:Example 1: [128000, 128006, 882, 128007, 271, 2746, 34989, 15453, 3952, 400, 2166, 449]
+INFO:litgpt.parquet_dataset:Example 2: [128000, 128006, 882, 128007, 271, 10086, 279, 2694, 315, 279, 865, 70150]
+INFO:litgpt.parquet_dataset:Rank 0/1 has 32 parquet files | identifier=34409af1
+INFO:litgpt.parquet_dataset:Example 0: [128000, 128006, 882, 128007, 271, 2746, 18984, 31094, 264, 2860, 315, 220]
+INFO:litgpt.parquet_dataset:Example 1: [128000, 128006, 882, 128007, 271, 95394, 8458, 5900, 12185, 2391, 264, 6412]
+INFO:litgpt.parquet_dataset:Example 2: [128000, 128006, 882, 128007, 271, 644, 813, 1176, 3280, 520, 7252, 41342]
+INFO:litgpt.parquet_dataset:Rank 0/1 has 32 parquet files | identifier=e5e4cee1
+INFO:litgpt.parquet_dataset:Example 0: [128000, 128006, 882, 128007, 271, 2746, 1070, 1051, 15453, 220, 1272, 26993]
+INFO:litgpt.parquet_dataset:Example 1: [128000, 128006, 882, 128007, 271, 2746, 34989, 15453, 3952, 400, 2166, 449]
+INFO:litgpt.parquet_dataset:Example 2: [128000, 128006, 882, 128007, 271, 10086, 279, 2694, 315, 279, 865, 70150]
+/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/distributed/fsdp/_state_dict_utils.py:817: UserWarning: When using ``NO_SHARD`` for ``ShardingStrategy``, full_state_dict willbe returned.
+  warnings.warn(
+/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/distributed/fsdp/_state_dict_utils.py:854: UserWarning: When using ``NO_SHARD`` for ``ShardingStrategy``, full_state_dict willbe returned.
+  warnings.warn(
+Counting rows in Parquet files using metadata.:   0%|          | 0/32 [00:00<?, ?it/s]Counting rows in Parquet files using metadata.: 100%|██████████| 32/32 [00:00<00:00, 1613.47it/s]
+Counting rows in Parquet files using metadata.:   0%|          | 0/32 [00:00<?, ?it/s]Counting rows in Parquet files using metadata.: 100%|██████████| 32/32 [00:00<00:00, 2181.09it/s]
+Counting rows in Parquet files using metadata.:   0%|          | 0/32 [00:00<?, ?it/s]Counting rows in Parquet files using metadata.: 100%|██████████| 32/32 [00:00<00:00, 6236.30it/s]
+Counting rows in Parquet files using metadata.:   0%|          | 0/32 [00:00<?, ?it/s]Counting rows in Parquet files using metadata.: 100%|██████████| 32/32 [00:00<00:00, 6398.63it/s]
+Estimating total tokens in Parquet files using 1 files.:   0%|          | 0/1 [00:00<?, ?it/s]
+Counting tokens in file 0/1:   0%|          | 0/1 [00:00<?, ?it/s][A
+Counting tokens in file 0/1: 100%|██████████| 1/1 [00:00<00:00,  1.72it/s][ACounting tokens in file 0/1: 100%|██████████| 1/1 [00:00<00:00,  1.72it/s]
+Estimating total tokens in Parquet files using 1 files.: 100%|██████████| 1/1 [00:00<00:00,  1.72it/s]Estimating total tokens in Parquet files using 1 files.: 100%|██████████| 1/1 [00:00<00:00,  1.72it/s]
+Estimating total tokens in Parquet files using 1 files.:   0%|          | 0/1 [00:00<?, ?it/s]
+Counting tokens in file 0/1:   0%|          | 0/1 [00:00<?, ?it/s][A
+Counting tokens in file 0/1: 100%|██████████| 1/1 [00:00<00:00,  1.80it/s][ACounting tokens in file 0/1: 100%|██████████| 1/1 [00:00<00:00,  1.79it/s]
+Estimating total tokens in Parquet files using 1 files.: 100%|██████████| 1/1 [00:00<00:00,  1.79it/s]Estimating total tokens in Parquet files using 1 files.: 100%|██████████| 1/1 [00:00<00:00,  1.79it/s]
+Counting rows in Parquet files using metadata.:   0%|          | 0/32 [00:00<?, ?it/s]Counting rows in Parquet files using metadata.: 100%|██████████| 32/32 [00:00<00:00, 11375.35it/s]
+Counting rows in Parquet files using metadata.:   0%|          | 0/32 [00:00<?, ?it/s]Counting rows in Parquet files using metadata.: 100%|██████████| 32/32 [00:00<00:00, 12256.21it/s]
+Counting rows in Parquet files using metadata.:   0%|          | 0/32 [00:00<?, ?it/s]Counting rows in Parquet files using metadata.: 100%|██████████| 32/32 [00:00<00:00, 12625.13it/s]
+Traceback (most recent call last):
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 2750, in <module>
+    CLI(setup)
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 27, in CLI
+    return auto_cli(*args, _stacklevel=3, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 106, in auto_cli
+    return _run_component(components, init)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 227, in _run_component
+    return component(**cfg)
+           ^^^^^^^^^^^^^^^^
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 646, in setup
+    main(
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 860, in main
+    fit(
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 1316, in fit
+    logits = model(input_ids)
+             ^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/lightning/fabric/wrappers.py", line 136, in forward
+    output = self._forward_module(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py", line 854, in forward
+    output = self._fsdp_wrapped_module(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/model.py", line 291, in forward
+    x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py", line 854, in forward
+    output = self._fsdp_wrapped_module(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/model.py", line 510, in forward
+    x_normed = self.norm_1(x)
+               ^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/model.py", line 1232, in forward
+    return (x_normed * weight.float()).to(dtype=dtype)
+            ~~~~~~~~~^~~~~~~~~~~~~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 80.00 MiB. GPU 0 has a total capacity of 93.08 GiB of which 6.75 MiB is free. Including non-PyTorch memory, this process has 93.06 GiB memory in use. Of the allocated memory 90.28 GiB is allocated by PyTorch, and 763.85 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 2750, in <module>
+[rank0]:     CLI(setup)
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 27, in CLI
+[rank0]:     return auto_cli(*args, _stacklevel=3, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 106, in auto_cli
+[rank0]:     return _run_component(components, init)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 227, in _run_component
+[rank0]:     return component(**cfg)
+[rank0]:            ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 646, in setup
+[rank0]:     main(
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 860, in main
+[rank0]:     fit(
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 1316, in fit
+[rank0]:     logits = model(input_ids)
+[rank0]:              ^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/lightning/fabric/wrappers.py", line 136, in forward
+[rank0]:     output = self._forward_module(*args, **kwargs)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py", line 854, in forward
+[rank0]:     output = self._fsdp_wrapped_module(*args, **kwargs)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/model.py", line 291, in forward
+[rank0]:     x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+[rank0]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/distributed/fsdp/fully_sharded_data_parallel.py", line 854, in forward
+[rank0]:     output = self._fsdp_wrapped_module(*args, **kwargs)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/model.py", line 510, in forward
+[rank0]:     x_normed = self.norm_1(x)
+[rank0]:                ^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/model.py", line 1232, in forward
+[rank0]:     return (x_normed * weight.float()).to(dtype=dtype)
+[rank0]:             ~~~~~~~~~^~~~~~~~~~~~~~~~
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 80.00 MiB. GPU 0 has a total capacity of 93.08 GiB of which 6.75 MiB is free. Including non-PyTorch memory, this process has 93.06 GiB memory in use. Of the allocated memory 90.28 GiB is allocated by PyTorch, and 763.85 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

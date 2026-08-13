@@ -1,0 +1,19 @@
+universe   = vanilla
+executable = /home/huangp/aiproj/driftmtplm/condor/pretrain_smoke_test.sh
+
+request_gpus   = 1
+request_cpus   = 8
+request_memory = 64G
+request_disk   = 20G
+
+# Prefer the node where we already confirmed a free H100, but don't require it.
+rank = (Machine == "pplxwngpu002.physics.ox.ac.uk")
+
+getenv     = false
+should_transfer_files = NO
+
+log    = /home/huangp/aiproj/driftmtplm/condor/logs/pretrain_smoke_test.$(Cluster).log
+output = /home/huangp/aiproj/driftmtplm/condor/logs/pretrain_smoke_test.$(Cluster).out
+error  = /home/huangp/aiproj/driftmtplm/condor/logs/pretrain_smoke_test.$(Cluster).err
+
+queue 1

@@ -27,6 +27,7 @@ dependencies:
   - wheel=0.47.0
   - zstd=1.5.7
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
       - aiohappyeyeballs==2.7.1
       - aiohttp==3.14.3
       - aiosignal==1.4.0
@@ -232,4 +233,4 @@ dependencies:
       - websocket-client==1.9.0
       - xxhash==3.8.1
       - yarl==1.24.5
-prefix: /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/.venv
+

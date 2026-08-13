@@ -1,0 +1,24 @@
+universe   = vanilla
+executable = /home/huangp/aiproj/driftmtplm/condor/pretrain_reproduce_full_2gpu.sh
+
+# --- GPU / resource requests ---
+request_gpus   = 2
+request_cpus   = 16
+request_memory = 128G
+
+# NOTE: reproduce_full.yaml currently has train.fsdp_device_mesh: 1x1, which
+# is single-GPU. For this job to actually use both requested GPUs, bump
+# fsdp_device_mesh to 1x2 (or 2x1) in reproduce_full.yaml before submitting.
+
+# --- environment ---
+getenv     = false
+should_transfer_files = NO
+# paths in the job script live under /data/snoplus, which is on shared
+# storage mounted on the execute nodes, so no file transfer is needed.
+
+# --- logging ---
+log    = /home/huangp/aiproj/driftmtplm/condor/logs/pretrain_reproduce_full_2gpu.$(Cluster).log
+output = /home/huangp/aiproj/driftmtplm/condor/logs/pretrain_reproduce_full_2gpu.$(Cluster).out
+error  = /home/huangp/aiproj/driftmtplm/condor/logs/pretrain_reproduce_full_2gpu.$(Cluster).err
+
+queue 1

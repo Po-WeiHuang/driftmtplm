@@ -1,0 +1,38 @@
+000 (5702489.000.000) 2026-08-13 20:10:42 Job submitted from host: <163.1.136.58:9618?addrs=163.1.136.58-9618+[fde1-53ba-e9a0-de11-9793-9e2-f84c-e365]-9618&alias=pplxcondor03.physics.ox.ac.uk&noUDP&sock=schedd_8103_8fff>
+...
+001 (5702489.000.000) 2026-08-13 20:10:43 Job executing on host: <163.1.136.65:9618?addrs=163.1.136.65-9618&alias=pplxwngpu002.physics.ox.ac.uk&noUDP&sock=startd_6173_be37>
+	SlotName: slot1_2@pplxwngpu002.physics.ox.ac.uk
+	AvailableGPUs = { GPUs_GPU_69f36d37 }
+	CondorScratchDir = "/condor/execute/dir_2246076"
+	Cpus = 8
+	Disk = 20974864
+	GPUs = 1
+	GPUs_GPU_69f36d37 = [ Id = "GPU-69f36d37"; Capability = 9.0; DeviceName = "NVIDIA H100 NVL"; DeviceUuid = "69f36d37-5814-5209-3413-b8c695c77692"; ECCEnabled = true; NvidiaDriver = "610.43.02"; DriverVersion = 13.3; DevicePciBusId = "0000:E1:00.0"; GlobalMemoryMb = 95312; MaxSupportedVersion = 13030 ]
+	Memory = 65536
+...
+006 (5702489.000.000) 2026-08-13 20:10:51 Image size of job updated: 472060
+	461  -  MemoryUsage of job (MB)
+	472060  -  ResidentSetSize of job (KB)
+...
+006 (5702489.000.000) 2026-08-13 20:10:57 Image size of job updated: 693916
+	461  -  MemoryUsage of job (MB)
+	472060  -  ResidentSetSize of job (KB)
+...
+005 (5702489.000.000) 2026-08-13 20:10:57 Job terminated.
+	(1) Normal termination (return value 1)
+		Usr 0 00:00:09, Sys 0 00:00:04  -  Run Remote Usage
+		Usr 0 00:00:00, Sys 0 00:00:00  -  Run Local Usage
+		Usr 0 00:00:09, Sys 0 00:00:04  -  Total Remote Usage
+		Usr 0 00:00:00, Sys 0 00:00:00  -  Total Local Usage
+	0  -  Run Bytes Sent By Job
+	0  -  Run Bytes Received By Job
+	0  -  Total Bytes Sent By Job
+	0  -  Total Bytes Received By Job
+	Partitionable Resources :    Usage  Request Allocated Assigned
+	   Cpus                 :        0        8         8 
+	   Disk (KB)            :        1 20971520  20974864 
+	   GPUs                 :                 1         1 "GPU-69f36d37"
+	   Memory (MB)          :      461    65536     65536 
+	   TimeExecute (s)      :       14                    
+	   TimeSlotBusy (s)     :       14                    
+...

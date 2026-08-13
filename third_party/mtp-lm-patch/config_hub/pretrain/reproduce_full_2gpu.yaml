@@ -34,7 +34,7 @@ train:
   fabric_strategy: fsdp
 
   # Device mesh shape for FSDP. (--train.fsdp_device_mesh)
-  fsdp_device_mesh: 1x4
+  fsdp_device_mesh: 1x2
 
   # Number of optimizer steps between saving checkpoints (type: Optional[int], default: 1000)
   save_interval: 10000
@@ -58,7 +58,7 @@ train:
   global_batch_size: 128
 
   # Number of samples per data-parallel rank (type: int, default: 4)
-  micro_batch_size: 32
+  micro_batch_size: 16
 
   # Number of iterations with learning rate warmup active (type: int, default: 2000)
   lr_warmup_steps: 2000

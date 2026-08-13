@@ -1,0 +1,50 @@
+/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/args.py:97: UserWarning: `--train.lr_warmup_steps` should be less than `--train.max_steps`. Got 2000 lr_warmup_steps and 2 max_steps.
+  warnings.warn(
+Initializing distributed: GLOBAL_RANK: 0, MEMBER: 1/1
+----------------------------------------------------------------------------------------------------
+distributed_backend=nccl
+All distributed processes registered. Starting with 1 processes
+----------------------------------------------------------------------------------------------------
+
+wandb: WARNING `resume` will be ignored since W&B syncing is set to `offline`. Starting a new run with run id 91s7n36l.
+wandb: Tracking run with wandb version 0.23.0
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/smoke_test/wandb/offline-run-20260813_201455-91s7n36l
+Traceback (most recent call last):
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 2750, in <module>
+    CLI(setup)
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 27, in CLI
+    return auto_cli(*args, _stacklevel=3, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 106, in auto_cli
+    return _run_component(components, init)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 227, in _run_component
+    return component(**cfg)
+           ^^^^^^^^^^^^^^^^
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 646, in setup
+    main(
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 684, in main
+    validate_args(hparams, train, eval, initial_checkpoint_dir, resume)
+  File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 2738, in validate_args
+    raise ValueError("\n".join(issues))
+ValueError: /home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py doesn't support the 'max_steps' argument. This is set in TrainArgs(save_interval=10000, save_latest_interval=1000, max_ckpts_to_keep=None, save_latest_ckpt=False, initial_save=False, final_save=True, log_interval=10, global_batch_size=128, micro_batch_size=32, lr_warmup_steps=2000, lr_warmup_fraction=None, epochs=None, max_tokens=2000000000, max_steps=2, max_time=None, max_seq_length=160, train_block_size=None, tie_embeddings=False, do_compile=False, compile_mode=None, dynamo_cache_size_limit=256, fabric_strategy='fsdp', fsdp_device_mesh='1x1', fsdp_activation_checkpointing=False, fsdp_limit_all_gathers=False, fsdp_state_dict_type='full', ignore_dataloader_state_on_resume=False, ignore_extra_keys_in_init_ckpt=False, sync_running_metrics=True, pt_dist_timeout_mins=None, lr_schedule='cosine', max_norm=1.0, peak_lr=1e-05, min_lr=None)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 2750, in <module>
+[rank0]:     CLI(setup)
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 27, in CLI
+[rank0]:     return auto_cli(*args, _stacklevel=3, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 106, in auto_cli
+[rank0]:     return _run_component(components, init)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/data/snoplus/weiiiiiii/aiproj/driftmtplm/.venv/lib/python3.11/site-packages/jsonargparse/_cli.py", line 227, in _run_component
+[rank0]:     return component(**cfg)
+[rank0]:            ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 646, in setup
+[rank0]:     main(
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 684, in main
+[rank0]:     validate_args(hparams, train, eval, initial_checkpoint_dir, resume)
+[rank0]:   File "/home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py", line 2738, in validate_args
+[rank0]:     raise ValueError("\n".join(issues))
+[rank0]: ValueError: /home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/pretrain.py doesn't support the 'max_steps' argument. This is set in TrainArgs(save_interval=10000, save_latest_interval=1000, max_ckpts_to_keep=None, save_latest_ckpt=False, initial_save=False, final_save=True, log_interval=10, global_batch_size=128, micro_batch_size=32, lr_warmup_steps=2000, lr_warmup_fraction=None, epochs=None, max_tokens=2000000000, max_steps=2, max_time=None, max_seq_length=160, train_block_size=None, tie_embeddings=False, do_compile=False, compile_mode=None, dynamo_cache_size_limit=256, fabric_strategy='fsdp', fsdp_device_mesh='1x1', fsdp_activation_checkpointing=False, fsdp_limit_all_gathers=False, fsdp_state_dict_type='full', ignore_dataloader_state_on_resume=False, ignore_extra_keys_in_init_ckpt=False, sync_running_metrics=True, pt_dist_timeout_mins=None, lr_schedule='cosine', max_norm=1.0, peak_lr=1e-05, min_lr=None)
