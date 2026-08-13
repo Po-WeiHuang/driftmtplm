@@ -1,7 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=mtp_llama8b
 #SBATCH --partition=medium
 #SBATCH --nodes=1
+#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:h100:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=256G
+#SBATCH --time=48:00:00
 
 # ---- GPU configuration ----
 # Must pin a GPU type: the installed torch==2.8.0+cu128 wheel's compiled kernel
@@ -16,16 +20,6 @@
 # "medium" partition (only "short"/"everything"), so l40s/a100/h100/rtx8000
 # are the relevant safe choices here; l40s has the most free capacity cluster-
 # wide as of 2026-08-12, so it's used below.
-#SBATCH --gres=gpu:l40s:4
-#SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-task=1
-
-# ---- CPU / Memory ----
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=256G
-
-# ---- Time ----
-#SBATCH --time=24:00:00
 
 # ---- Logs ----
 #SBATCH --output=logs/%x_%j.out
@@ -87,7 +81,4 @@ cd /home/exet5937/aiproj/driftmtplm/third_party/mtp-lm
 ####################################################
 
 srun python -u litgpt/pretrain.py \
-    --config=../mtp-lm-patch/config_hub/pretrain/reproduce_full.yaml \
-    --model_name=$MODEL_NAME \
-    --tokenizer_dir=$INITIAL_CHECKPOINT \
-    --initial_checkpoint_dir=$INITIAL_CHECKPOINT
+    --config=../mtp-lm-patch/config_hub/pretrain/reproduce_full.yaml

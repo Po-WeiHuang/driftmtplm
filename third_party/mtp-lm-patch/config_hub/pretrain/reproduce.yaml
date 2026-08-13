@@ -22,7 +22,7 @@ initial_checkpoint_dir: /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/chec
 # from the latest checkpoint in ``out_dir``. An error will be raised if no checkpoint is found. Passing
 # ``'auto'`` will resume from the latest checkpoint but not error if no checkpoint exists.
 # (type: Union[bool, Literal["auto"], Path], default: False)
-resume: true
+resume: false
 
 # Data-related arguments. If not provided, the default is ``litgpt.data.TinyLlama``.
 data: pqds
