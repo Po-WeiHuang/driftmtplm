@@ -73,7 +73,7 @@ train:
   max_steps:
 
   # Limits the length of samples. Off by default (type: Optional[int], default: null)
-  max_seq_length: 160
+  max_seq_length: 48
 
   # Whether to tie the embedding weights with the language modeling head weights. (type: Optional[bool], default: False)
   tie_embeddings: False
@@ -152,12 +152,12 @@ seed: 42
 singleshot:
   mtp_special_token_pattern: "<|mtp_special_token_{i}|>"
   hard_teacher_supervision: false
-  truncation_length: 160
+  truncation_length: 48
   k_toks_min: "0-2"
   k_toks_max: "0-16"
   rand_rank_k_toks: True
-  mask_region_ct: 5
-  rollout_multiplier: 4
+  mask_region_ct: 3
+  rollout_multiplier: 3
 
 # Pretokenized/preprocessed dataset (pqds) arguments. (--pqds.*)
 pqds:

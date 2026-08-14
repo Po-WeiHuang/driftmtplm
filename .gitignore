@@ -3,3 +3,4 @@ CLAUDE.md
 third_party/mtp-lm-patch/slurm_jobsubmit/logs/
 .claude/
 .venv/
+condor/
