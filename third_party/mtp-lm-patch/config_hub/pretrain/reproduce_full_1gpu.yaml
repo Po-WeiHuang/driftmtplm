@@ -52,7 +52,7 @@ train:
   lr_schedule: cosine
 
   # Number of iterations between logging calls (type: int, default: 1)
-  log_interval: 10
+  log_interval: 20
 
   # Number of samples between optimizer steps across data-parallel ranks (type: int, default: 512)
   global_batch_size: 128
@@ -73,7 +73,7 @@ train:
   max_steps:
 
   # Limits the length of samples. Off by default (type: Optional[int], default: null)
-  max_seq_length: 48
+  max_seq_length: 160
 
   # Whether to tie the embedding weights with the language modeling head weights. (type: Optional[bool], default: False)
   tie_embeddings: False
@@ -85,7 +85,7 @@ train:
   peak_lr: 1e-5
 
   #   (type: float, default: 4e-05)
-  min_lr: null
+  min_lr: 6e-7
 
   # Whether to torch.compile the model. (--train.do_compile)
   do_compile: True
@@ -96,7 +96,7 @@ train:
 # Evaluation-related arguments. See ``litgpt.args.EvalArgs`` for details
 eval:
   # Number of optimizer steps between evaluation calls (type: int, default: 1000)
-  interval: 1000
+  interval: 2000
 
   # Number of tokens to generate (type: Optional[int], default: null)
   max_new_tokens:
@@ -151,13 +151,15 @@ seed: 42
 # Singleshot MTP masking/rollout arguments. (--singleshot.*)
 singleshot:
   mtp_special_token_pattern: "<|mtp_special_token_{i}|>"
-  hard_teacher_supervision: false
-  truncation_length: 48
+  hard_teacher_supervision: true
+  hard_self_teacher_supervision: false
+  extra_train_metrics: true
+  truncation_length: 160
   k_toks_min: "0-2"
   k_toks_max: "0-16"
   rand_rank_k_toks: True
-  mask_region_ct: 3
-  rollout_multiplier: 3
+  mask_region_ct: 5
+  rollout_multiplier: 4
 
 # Pretokenized/preprocessed dataset (pqds) arguments. (--pqds.*)
 pqds:
@@ -167,6 +169,6 @@ pqds:
   val_dataset_folder_path: /data/snoplus/weiiiiiii/aiproj/driftmtplm/dataset/train/outputs/l3_magpie_metamath/processed/val
 # Weights & Biases logging arguments. (--wandb.*)
 wandb:
-  run_name: l3_magpie_metamath
+  run_name: Rep_l3_magpie_metamath
   project: drift-mtp
   entity: po-wei-huang-university-of-oxford

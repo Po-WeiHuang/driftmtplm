@@ -52,7 +52,7 @@ train:
   lr_schedule: cosine
 
   # Number of iterations between logging calls (type: int, default: 1)
-  log_interval: 10
+  log_interval: 20
 
   # Number of samples between optimizer steps across data-parallel ranks (type: int, default: 512)
   global_batch_size: 128
@@ -85,7 +85,7 @@ train:
   peak_lr: 1e-5
 
   #   (type: float, default: 4e-05)
-  min_lr: null
+  min_lr: 6e-7
 
   # Whether to torch.compile the model. (--train.do_compile)
   do_compile: True
@@ -151,7 +151,9 @@ seed: 42
 # Singleshot MTP masking/rollout arguments. (--singleshot.*)
 singleshot:
   mtp_special_token_pattern: "<|mtp_special_token_{i}|>"
-  hard_teacher_supervision: false
+  hard_teacher_supervision: true
+  hard_self_teacher_supervision: false
+  extra_train_metrics: true
   truncation_length: 160
   k_toks_min: "0-2"
   k_toks_max: "0-16"
