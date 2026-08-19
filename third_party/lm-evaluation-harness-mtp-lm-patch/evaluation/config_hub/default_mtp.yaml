@@ -1,0 +1,29 @@
+model: hf
+model_args:
+  pretrained: /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/reproduce/step-00060000
+  dtype: float32
+
+trust_remote_code: true
+
+gen_kwargs:
+  do_sample: false
+  until:
+  - </s>
+  - <|end_of_text|>
+  - <|eot_id|>
+  - <|endoftext|>
+  - <|im_end|>
+  do_mtp: true
+  k_toks: 1
+  strategy: null
+  mask_id: 128259
+  eos_id:
+  - 128009
+  - 128001
+  include_prompt: true
+  return_mtp_result_dict: true
+
+batch_size: 1
+
+output_path: ./outputs/lm_eval
+log_samples: true

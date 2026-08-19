@@ -8,7 +8,7 @@ model_config:
 
 # Directory in which to save checkpoints and logs. If running in a Lightning Studio Job, look for it in
 # /teamspace/jobs/<job-name>/share. (type: <class 'Path'>, default: out/pretrain)
-out_dir: /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/reproduce
+out_dir: /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/reproduce2
 
 # The precision to use for pretraining. Possible choices: "bf16-true", "bf16-mixed", "32-true". (type: Optional[str], default: null)
 # precision: bf16-mixed
@@ -49,7 +49,7 @@ train:
   max_ckpts_to_keep: null
 
   # Learning rate schedule. (--train.lr_schedule)
-  lr_schedule: cosine
+  lr_schedule: constant
 
   # Number of iterations between logging calls (type: int, default: 1)
   log_interval: 20
@@ -85,7 +85,7 @@ train:
   peak_lr: 1e-5
 
   #   (type: float, default: 4e-05)
-  min_lr: 6e-7
+  min_lr: null
 
   # Whether to torch.compile the model. (--train.do_compile)
   do_compile: True
@@ -153,7 +153,7 @@ singleshot:
   mtp_special_token_pattern: "<|mtp_special_token_{i}|>"
   hard_teacher_supervision: true
   hard_self_teacher_supervision: false
-  extra_train_metrics: true
+  extra_train_metrics: false
   truncation_length: 160
   k_toks_min: "0-2"
   k_toks_max: "0-16"
