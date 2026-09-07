@@ -118,7 +118,7 @@ def _mean_std_ratio(values: Sequence[float]) -> Dict[str, float]:
     t = torch.tensor(list(values), dtype=torch.float64)
     mean = t.mean().item()
     std = t.std(unbiased=False).item() if t.numel() > 1 else 0.0
-    ratio = mean / std if std > 0.0 else float("inf")
+    ratio = mean / (std + 1e-12)
     return {"mean": mean, "std": std, "ratio": ratio}
 
 
