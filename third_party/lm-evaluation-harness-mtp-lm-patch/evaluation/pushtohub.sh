@@ -11,10 +11,15 @@ export CKPT_SUBDIR=latest
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO}/mtp-lm"
 
-litgpt convert_from_litgpt \
-    --checkpoint_dir=$RUN_OUTPUT_DIR/$CKPT_SUBDIR \
-    --output_dir=$RUN_OUTPUT_DIR/$CKPT_SUBDIR \
-    --output_name=pytorch_model.bin \
-    --skip_if_exists=True \
-    --config_class_path=litgpt.transformers_local.llama.configuration_llama.LlamaConfig \
-    --model_class_path=litgpt.transformers_local.llama.modeling_llama.LlamaForCausalLM
+
+litgpt push_to_hub \
+--model_path=$RUN_OUTPUT_DIR/$CKPT_SUBDIR \
+--model_class_path=litgpt.transformers_local.llama.modeling_llama.LlamaForCausalLM \
+--org=weiiiiiiiiiiiiiiiii \
+--private=False \
+--model_name=Llama-3.2-1B-Instruct-drift \
+--precision=bfloat16 \
+--dry_run=False \
+--update_existing=True \
+--readme_path=litgpt/transformers_local/llama/README.md \
+--readme_only=False

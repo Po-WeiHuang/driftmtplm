@@ -1,0 +1,33 @@
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index c927a51..855144e 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -1558,6 +1558,12 @@ def fit(
+             # drift_weight=0.0 (the default whenever drift_enabled=True) makes this an exact
+             # (not just approximate) no-op on the backward pass -- the Phase 4
+             # backward-compatibility test.
++            # Timed separately from time_prefix_loss/time_bwd: the drift loss builds R x R
++            # pairwise distance matrices per horizon per temperature, and PHASE 5 asks
++            # specifically to check for "large slowdown from pairwise distance matrices".
++            # Without its own timer this cost lands in no time_* bucket at all (only in
++            # time_iter_total), so the check would have nothing to read.
++            drift_loss_t0 = time.perf_counter()
+             drift_loss = torch.tensor(0.0, device=fabric.device)
+             if hparams.singleshot.drift_enabled:
+                 drift_result = compute_drift_loss_fn(
+@@ -1575,6 +1581,7 @@ def fit(
+                 total_loss = loss + hparams.singleshot.drift_weight * drift_loss
+             else:
+                 total_loss = loss
++            drift_loss_t1 = time.perf_counter()
+ 
+             bwd_t0 = time.perf_counter()
+             fabric.backward(total_loss / train.gradient_accumulation_iters(devices, num_nodes))
+@@ -1724,6 +1731,7 @@ def fit(
+                 "time_metrics": metrics_t1 - metrics_t0,
+                 "time_main_loss": main_loss_t1 - main_loss_t0,
+                 "time_prefix_loss": prefix_loss_t1 - prefix_loss_t0,
++                "time_drift_loss": drift_loss_t1 - drift_loss_t0,
+                 "time_bwd": bwd_t1 - bwd_t0,
+                 "time_post_bwd": post_bwd_t1 - post_bwd_t0,
+                 "time_grad_clip": grad_clip_t1 - grad_clip_t0,

@@ -1,0 +1,38 @@
+diff --git a/litgpt/args.py b/litgpt/args.py
+index 5f69482..f303517 100644
+--- a/litgpt/args.py
++++ b/litgpt/args.py
+@@ -373,6 +373,21 @@ class SingleShotArgs:
+     adaptive weight that pinned lambda_drift * L_drift / L_MTP to a constant was tried and
+     removed, because it holds the drift term up forever and defeats exactly that fade."""
+ 
++    drift_exclude_self_positive: bool = True
++    """DriftMTP: mask the query's OWN paired teacher token out of the positive population,
++    mirroring the self-exclusion that has always been applied to the negative population.
++
++    y_pos[r] is the teacher state for the SAME token as the student query x[r]. As the student
++    converges toward the teacher that pair's distance goes to zero and, at low tau, its softmax
++    weight goes to 1 -- the positive mass collapses onto a single self-pair, while the negative
++    population still has its own self-pair removed. That asymmetry leaves a systematic residual
++    field that does not vanish at equilibrium, so "student == teacher" is NOT a fixed point of
++    the original construction. Masking both sides restores the symmetry the paper's unpaired
++    positives have for free.
++
++    True (default) is the symmetric construction. False reproduces the original asymmetric one;
++    use it only to reproduce runs from before this change."""
++
+     drift_temperatures: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
+     """DriftMTP Phase 4: the base Laplace-kernel temperatures tau (claudedriftingplan.md >
+     Drifting Normalization > Kernel Temperature), SUMMED after per-temperature RMS field
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index ae73e35..7e69318 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -1575,6 +1575,7 @@ def fit(
+                     temperatures=hparams.singleshot.drift_temperatures,
+                     eta=hparams.singleshot.drift_step_size,
+                     use_column_norm=hparams.singleshot.drift_use_column_norm,
++                    exclude_self_positive=hparams.singleshot.drift_exclude_self_positive,
+                 )
+                 drift_loss = drift_result.loss
+                 drift_accum_tracker.update(drift_result.per_horizon_results, k_toks)

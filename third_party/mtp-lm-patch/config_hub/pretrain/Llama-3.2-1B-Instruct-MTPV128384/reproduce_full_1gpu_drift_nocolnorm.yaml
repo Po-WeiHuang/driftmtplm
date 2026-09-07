@@ -1,3 +1,35 @@
+# Llama-3.2-1B-Instruct-MTPV128384 -- FULL production run, MTP + token drift.
+#
+# This is reproduce_full_1gpu.yaml with the singleshot.drift_* block added and
+# nothing else touched except:
+#   * dataset/checkpoint/tokenizer paths, repointed from the other cluster's
+#     /data/phys-snoplus-snews/exet5937/... root to this one's
+#     /data/snoplus/weiiiiiii/... root;
+#   * out_dir, given a -drift suffix so the two arms cannot collide;
+#   * resume: auto instead of true (see the note there);
+#   * the wandb run name.
+# Batch shape, LR schedule, optimizer, precision, eval/checkpoint cadence,
+# max_tokens and the whole non-drift singleshot block are UNCHANGED, so the two
+# arms are directly comparable.
+#
+# Setting drift_enabled: false AND drift_diagnostics_enabled: false reproduces
+# vanilla MTP exactly -- see the note in the singleshot block.
+#
+# do_compile is inherited as True from the production config. The
+# torch.compile / drift-loss interaction was previously untested; it is now
+# VERIFIED by condor run 5758027 (SMOKE=1, 20 optimizer steps, compile on,
+# drift on): it compiles, trains, and logs drift/loss = 5.613, matching the
+# 5.648 measured in the uncompiled 200-step runs to within 0.6%. Compile also
+# cuts iteration time from ~370 ms to ~229 ms.
+#
+# NOTE that run first failed with
+#   InductorError: ModuleNotFoundError: No module named 'setuptools.command'
+# which was NOT a drift/compile problem: setuptools in the venv was a broken
+# partial install (540 of 762 files missing), and only torch.compile exercises
+# it. Repaired and pinned as setuptools==83.0.0 in both conda_env.yml and
+# requirements-lock.txt. If a fresh environment hits this again, reinstall
+# setuptools before blaming the drift path.
+
 # The name of the model to pretrain. Choose from names in ``litgpt.config``. Mutually exclusive with
 # ``model_config``. (type: Optional[str], default: null)
 model_name: Llama-3.2-1B-Instruct-MTPV128384
@@ -8,7 +40,7 @@ model_config:
 
 # Directory in which to save checkpoints and logs. If running in a Lightning Studio Job, look for it in
 # /teamspace/jobs/<job-name>/share. (type: <class 'Path'>, default: out/pretrain)
-out_dir: /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/outputs/Llama-3.2-1B-Instruct
+out_dir: /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/Llama-3.2-1B-Instruct-drift_nocolnorm
 
 # The precision to use for pretraining. Possible choices: "bf16-true", "bf16-mixed", "32-true". (type: Optional[str], default: null)
 # precision: bf16-mixed
@@ -16,13 +48,16 @@ precision: bf16-true
 
 # Optional path to a checkpoint directory to initialize the model from.
 # Useful for continued pretraining. Mutually exclusive with ``resume``. (type: Optional[Path], default: null)
-initial_checkpoint_dir: /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/checkpoints/extended/meta-llama/Llama-3.2-1B-Instruct-MTPV128384
+initial_checkpoint_dir: /data/snoplus/weiiiiiii/aiproj/driftmtplm/checkpoints/extended/meta-llama/Llama-3.2-1B-Instruct-MTPV128384
                         
 # Path to a checkpoint directory to resume from in case training was interrupted, or ``True`` to resume
 # from the latest checkpoint in ``out_dir``. An error will be raised if no checkpoint is found. Passing
 # ``'auto'`` will resume from the latest checkpoint but not error if no checkpoint exists.
 # (type: Union[bool, Literal["auto"], Path], default: False)
-resume: true
+# NOTE: "auto", not the production file's "true". `true` raises if no checkpoint
+# exists yet, which is exactly the fresh-start case for this arm. "auto" resumes
+# a checkpoint if one is there and starts clean if not.
+resume: auto
 
 # Data-related arguments. If not provided, the default is ``litgpt.data.TinyLlama``.
 data: pqds
@@ -140,7 +175,7 @@ num_nodes: 1
 
 # Optional path to the tokenizer dir that was used for preprocessing the dataset. Only some data
 # module require this. (type: Optional[Path], default: null)
-tokenizer_dir: /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/checkpoints/extended/meta-llama/Llama-3.2-1B-Instruct-MTPV128384
+tokenizer_dir: /data/snoplus/weiiiiiii/aiproj/driftmtplm/checkpoints/extended/meta-llama/Llama-3.2-1B-Instruct-MTPV128384
 
 # The name of the logger to send metrics to. (type: Literal['wandb', 'tensorboard', 'csv'], default: tensorboard)
 logger_name: wandb
@@ -161,14 +196,59 @@ singleshot:
   mask_region_ct: 5
   rollout_multiplier: 4
 
+  # ------------------------------------------------------------------
+  # DriftMTP. Everything ABOVE this line is byte-identical to
+  # reproduce_full_1gpu.yaml, so this file is that config plus drift.
+  #
+  # TO REPRODUCE VANILLA MTP: set BOTH of the next two to false.
+  #   * drift_enabled: false  -> pretrain.py takes `total_loss = loss`, with
+  #     the drift loss never computed and no gradient contribution at all.
+  #   * drift_diagnostics_enabled: false -> the Phase 2 diagnostics hook is
+  #     gated on its OWN flag, independent of drift_enabled, so leaving it on
+  #     would still add forward work and logging to a "vanilla" run.
+  # With both false this file is the vanilla config in every respect except
+  # out_dir, resume and the wandb run name.
+  # ------------------------------------------------------------------
+  drift_enabled: true
+  drift_diagnostics_enabled: false
+  drift_diagnostics_mmd_warmup_steps: 2000
+
+  # lambda_drift, FIXED for the whole run -- there is no adaptive mode.
+  # Calibrated for ~10% of the native MTP loss in the PLATEAU region, which is
+  # where a full run spends nearly all its time, NOT at initialization:
+  #   L_MTP(plateau) = 0.6    (run ipwhlbyo "Rep_l3_magpie_metamath", 1.6M
+  #                            global steps: mean `loss` 0.54 over the last
+  #                            half, 0.64 over the 20-50% band)
+  #   L_drift        = 5.648  (measured mean over 200 steps of condor run
+  #                            5758025, this exact drift config; std 0.28)
+  #   lambda         = 0.1 * 0.6 / 5.648 = 1.06e-2
+  # Expect drift/aux_native_loss_ratio ~1.3% at the start and ~10% once L_MTP
+  # reaches its plateau. See docs/phase5_sanity_experiment_report.md s17.7.
+  drift_weight: 1.06e-2
+
+  # Mask the query's OWN paired teacher token out of the positives, mirroring
+  # the self-exclusion always applied to the negatives. Without it, y_pos[r] is
+  # the teacher state for the same token as x[r], so as the student converges
+  # that pair sits at distance 0 and takes all the positive mass while its own
+  # negative is masked -- a systematic residual that makes "student == teacher"
+  # NOT a fixed point. Report s17.
+  drift_exclude_self_positive: true
+
+  # Paper's temperature ladder. Summed (not averaged) after per-temperature RMS
+  # field normalization, so a rung damped by eps drops out instead of dividing
+  # the survivors by n_tau.
+  drift_temperatures: [0.02, 0.05, 0.2]
+  drift_step_size: 1.0
+  drift_use_column_norm: false
+
 # Pretokenized/preprocessed dataset (pqds) arguments. (--pqds.*)
 pqds:
   dataset_script_config_file: config_hub/data/p2p_generic_metamath.yaml
   dataset_sources_config_file: config_hub/data/metamath_strat_split_chat_train.yaml
-  train_dataset_folder_path: /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/dataset/train/outputs/Llama-3.2-1B-Instruct-MTPV128384/processed/train
-  val_dataset_folder_path: /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/dataset/train/outputs/Llama-3.2-1B-Instruct-MTPV128384/processed/val
+  train_dataset_folder_path: /data/snoplus/weiiiiiii/aiproj/driftmtplm/dataset/train/outputs/Llama-3.2-1B-Instruct-MTPV128384/processed/train
+  val_dataset_folder_path: /data/snoplus/weiiiiiii/aiproj/driftmtplm/dataset/train/outputs/Llama-3.2-1B-Instruct-MTPV128384/processed/val
 # Weights & Biases logging arguments. (--wandb.*)
 wandb:
-  run_name: 1b_Instruct_metamath_column
+  run_name: drift_l3_1b_Instruct_metamath_lam1.06e-2_nocolnorm
   project: drift-mtp
   entity: po-wei-huang-university-of-oxford

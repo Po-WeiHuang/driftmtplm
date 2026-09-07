@@ -1,0 +1,69 @@
+diff --git a/litgpt/args.py b/litgpt/args.py
+index eb46cc4..5f69482 100644
+--- a/litgpt/args.py
++++ b/litgpt/args.py
+@@ -363,11 +363,19 @@ class SingleShotArgs:
+     drift_weight: float = 0.0
+     """DriftMTP Phase 4: lambda_drift, the token drifting loss weight. Only has an effect when
+     drift_enabled=True. Default 0.0 is deliberately inert even when drift_enabled=True, so
+-    turning drift_enabled on by itself never changes the training objective."""
++    turning drift_enabled on by itself never changes the training objective.
++
++    This is a FIXED constant for the whole run. Calibrate it so the weighted drift term is a
++    chosen fraction of L_MTP at the START of training (~10% is the working default), then let
++    it decay on its own: rms_field_normalize divides by (lambda_tau + eps), so a temperature
++    whose raw field falls below eps stops being renormalized back to unit scale and its
++    contribution decays toward zero as the student population converges to the teacher. An
++    adaptive weight that pinned lambda_drift * L_drift / L_MTP to a constant was tried and
++    removed, because it holds the drift term up forever and defeats exactly that fade."""
+ 
+     drift_temperatures: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
+     """DriftMTP Phase 4: the base Laplace-kernel temperatures tau (claudedriftingplan.md >
+-    Drifting Normalization > Kernel Temperature), averaged after per-temperature RMS field
++    Drifting Normalization > Kernel Temperature), SUMMED after per-temperature RMS field
+     normalization (Multi-Temperature Field Normalization). Default matches the paper's
+     {0.02, 0.05, 0.2}."""
+ 
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index 855144e..ae73e35 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -1578,6 +1578,11 @@ def fit(
+                 )
+                 drift_loss = drift_result.loss
+                 drift_accum_tracker.update(drift_result.per_horizon_results, k_toks)
++                # lambda_drift is a fixed constant for the whole run. It is deliberately
++                # NOT adapted to hold a constant L_drift/L_MTP ratio: the drift term is
++                # meant to fade as the student population converges to the teacher, via
++                # rms_field_normalize's V / (lambda_tau + eps) damping once a temperature's
++                # raw field falls below eps. Holding the ratio fixed would defeat that.
+                 total_loss = loss + hparams.singleshot.drift_weight * drift_loss
+             else:
+                 total_loss = loss
+@@ -1769,16 +1774,25 @@ def fit(
+             if hparams.singleshot.drift_enabled:
+                 native_mtp_loss = loss_rank0.item()
+                 mean_drift_loss = running_drift_loss.compute().item()
+-                weighted_drift_loss = hparams.singleshot.drift_weight * mean_drift_loss
++                effective_drift_weight = hparams.singleshot.drift_weight
++                weighted_drift_loss = effective_drift_weight * mean_drift_loss
+                 drift_metrics = {
+                     "drift/native_mtp_loss": native_mtp_loss,
+                     "drift/loss": mean_drift_loss,
++                    "drift/lambda_effective": effective_drift_weight,
+                     "drift/weighted_loss": weighted_drift_loss,
+                     "drift/total_loss": native_mtp_loss + weighted_drift_loss,
+                     # Cheap proxy for the paper's "auxiliary/native gradient ratio if available":
+                     # a true per-parameter gradient-norm ratio needs a second backward pass per
+                     # logged iteration (doubling backward cost), which the spec explicitly marks
+                     # optional ("if available") -- this loss-magnitude ratio is used instead.
++                    #
++                    # lambda_drift is fixed, so this ratio is free-running: it is calibrated
++                    # to ~0.10 at the start of the run and is EXPECTED to fall from there as
++                    # L_MTP decays and the drift field is damped by eps. A ratio pinned flat
++                    # at its initial value means the eps fade never engaged (check
++                    # drift/raw_field_rms_tau_* against eps); a ratio that climbs means
++                    # L_MTP is falling faster than the drift term is fading.
+                     "drift/aux_native_loss_ratio": weighted_drift_loss / (abs(native_mtp_loss) + 1e-8),
+                 }
+                 drift_metrics.update(drift_accum_tracker.compute(prefix="drift"))
