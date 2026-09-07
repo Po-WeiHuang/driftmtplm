@@ -16,3 +16,4 @@ graphify-out/
 tests/
 third_party/mtp-lm-patch/misc_scripts_and_nbs/__pycache__/
 src/driftmtp/metrics/__pycache__/
+claudemetricsplan.md
