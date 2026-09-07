@@ -8,3 +8,11 @@ wandb/
 third_party/mtp-lm-patch/slurm_jobsubmit/
 third_party/mtp-lm-patch/proposal_llama-3.2-1b.md
 third_party/mtp-lm-patch/dwload_traindst_cmd_llama32-1b-instruct.sh
+.vscode/
+claudedriftingplan.md
+docs/
+experiments/
+graphify-out/
+tests/
+third_party/mtp-lm-patch/misc_scripts_and_nbs/__pycache__/
+src/driftmtp/metrics/__pycache__/

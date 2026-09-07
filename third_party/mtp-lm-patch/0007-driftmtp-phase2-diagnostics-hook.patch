@@ -1,0 +1,198 @@
+diff --git a/litgpt/args.py b/litgpt/args.py
+index 4d4e716..1cb60c7 100644
+--- a/litgpt/args.py
++++ b/litgpt/args.py
+@@ -330,6 +330,26 @@ class SingleShotArgs:
+     last_region_loss_only: bool = False
+     """Debug flag for only computing single-shot loss on the last masked region during training when using multiple masked regions."""
+ 
++    drift_diagnostics_enabled: bool = False
++    """DriftMTP Phase 2: whether to compute diagnostic-only ECE/MMD/Sinkhorn metrics comparing
++    student and teacher predictive states during training (see src/driftmtp/validation.py and
++    claudedriftingplan.md > Validation Metrics). Purely diagnostic: never affects the training
++    objective, gradients, or model parameters. Computed only on the same iterations already
++    gated by train.log_interval, reusing that step's existing student/teacher forward passes
++    (no extra forward pass, no extra dataloader). Default False recovers exactly the prior
++    (pre-DriftMTP) training behavior."""
++
++    drift_diagnostics_mmd_warmup_steps: int = 2000
++    """DriftMTP Phase 2: number of training iterations (state["iter_num"], NOT optimizer steps
++    or diagnostic-call count) over which the shared MMD kernel bandwidth is recomputed from
++    horizon-1 features on each diagnostic step; frozen at its last value for every iteration
++    after this. Deliberately independent of train.lr_warmup_steps (a different concept -- LR
++    schedule vs. kernel-scale stabilization), not derived from it. Must be several multiples of
++    log_iter_interval (train.log_interval * gradient_accumulation_iters) to actually let the
++    bandwidth recompute more than once before freezing, since diagnostics -- and therefore
++    bandwidth updates -- only run on log_iter_interval-aligned iterations. See
++    src/driftmtp/metrics/mmd.py (MMDBandwidthSchedule) for the policy this implements."""
++
+ 
+ def parse_temp_sep_token_id_range(temp_sep_token_id_range: str):
+     """'128011-128255' -> (128011, 128255)"""
+diff --git a/litgpt/model.py b/litgpt/model.py
+index a31b69b..0ed5f65 100644
+--- a/litgpt/model.py
++++ b/litgpt/model.py
+@@ -204,7 +204,8 @@ class GPT(nn.Module):
+         input_pos: Optional[torch.Tensor] = None,
+         input_pos_maxp1: Optional[int] = None,
+         lm_head_chunk_size: int = 0,
+-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
++        return_hidden_states: bool = False,
++    ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]]:
+         """
+         If `input_pos` is provided, the KV cache uses K and V vectors for
+         positions smaller than entries in `input_pos`. For efficiency, pass
+@@ -225,12 +226,20 @@ class GPT(nn.Module):
+             input_pos_maxp1: Optional. See above.
+             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
+                 `lm_head` computation is done in chunks of this size.
++            return_hidden_states: Optional, default False. If True, also
++                return the final-layer hidden state (post `ln_f`, pre
++                `lm_head`), shape `(B, T, config.n_embd)`, as a second
++                return value: `(logits, hidden_states)`. DriftMTP
++                integration hook (see `src/driftmtp/`); does not affect the
++                return value when left at its default.
+ 
+         Returns:
+             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
+             `lm_head_chunk_size > 0`, this is a list of chunks of shape
+             `(B, lm_head_chunk_size, config.padded_vocab_size)`, the final
+-            entry can be shorter.
++            entry can be shorter. If `return_hidden_states` is True, a
++            `(logits, hidden_states)` tuple is returned instead, where
++            `logits` is exactly the value described above.
+ 
+         """
+         T = idx.size(1)
+@@ -297,9 +306,13 @@ class GPT(nn.Module):
+         )
+         if lm_head_chunk_size > 0:
+             # chunk the lm head logits to reduce the peak memory used by autograd
+-            return [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
++            logits = [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
+         else:
+-            return clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
++            logits = clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
++
++        if return_hidden_states:
++            return logits, x  # x: (B, T, config.n_embd), post-ln_f, pre-lm_head
++        return logits
+ 
+     @classmethod
+     def from_name(cls, name: str, **kwargs: Any) -> Self:
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index 2730753..de3ccbc 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -4,6 +4,7 @@
+ from jsonargparse import CLI, set_parsing_settings
+ 
+ import os
++import sys
+ import math
+ import pprint
+ import time
+@@ -1081,6 +1082,24 @@ def fit(
+     initial_iter = state["iter_num"]
+     train_iterator = CycleIterator(train_dataloader)
+ 
++    # DriftMTP Phase 2 (diagnostic-only): resolve the compute_training_diagnostics hook once,
++    # only when enabled, so a disabled run never imports or touches src/driftmtp/ at all.
++    # See claudedriftingplan.md > Validation Metrics > Decided Implementation (Phase 2 scope).
++    compute_training_diagnostics_fn = None
++    mmd_bandwidth_schedule = None
++    if hparams.singleshot.drift_diagnostics_enabled:
++        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
++        if _driftmtp_src_dir not in sys.path:
++            sys.path.insert(0, _driftmtp_src_dir)
++        from driftmtp.validation import compute_training_diagnostics as compute_training_diagnostics_fn
++        from driftmtp.metrics.mmd import MMDBandwidthSchedule
++        # One shared instance for the whole run: recomputes the MMD kernel bandwidth from
++        # horizon-1 features on every diagnostic step while warming up, then freezes it, so
++        # the MMD trend over training is measured against one fixed baseline. See mmd.py.
++        mmd_bandwidth_schedule = MMDBandwidthSchedule(
++            warmup_steps=hparams.singleshot.drift_diagnostics_mmd_warmup_steps
++        )
++
+     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+     running_grad_norm = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+ 
+@@ -1138,6 +1157,17 @@ def fit(
+ 
+         state["iter_num"] += 1
+ 
++        # DriftMTP Phase 2 (diagnostic-only): only compute/request hidden states on iterations
++        # that will actually be logged, so a disabled (or between-log) step pays zero extra cost.
++        # Requires the student-forced teacher pass, so it is inapplicable under
++        # gt_teacher_supervision (which skips that pass entirely).
++        run_drift_diagnostics = (
++            (compute_training_diagnostics_fn is not None)
++            and (state["iter_num"] % log_iter_interval == 0)
++            and (not hparams.singleshot.gt_teacher_supervision)
++        )
++        drift_diagnostics = {}
++
+         data_mask_prep_t0 = time.perf_counter()
+         train_data_len = train_data.shape[1] - 1
+         input_ids = train_data[:, 0 : train_data_len].contiguous().long()
+@@ -1322,7 +1352,11 @@ def fit(
+             
+             fwd_t0 = time.perf_counter()
+             # 1. student prediction pass
+-            logits = model(input_ids)
++            student_fwd_out = model(input_ids, return_hidden_states=run_drift_diagnostics)
++            if run_drift_diagnostics:
++                logits, student_hidden = student_fwd_out
++            else:
++                logits, student_hidden = student_fwd_out, None
+             soft_stud_preds = logits[pred_pos_mask].view(tot_mask_regions, k_toks, -1)
+ 
+             # 1.1 prep for aux prefix supervision
+@@ -1351,10 +1385,35 @@ def fit(
+ 
+             if not hparams.singleshot.gt_teacher_supervision:
+                 with torch.no_grad():
+-                    logits_teacher = model_teacher(stud_forcing_input_ids)
++                    teacher_fwd_out = model_teacher(
++                        stud_forcing_input_ids, return_hidden_states=run_drift_diagnostics
++                    )
++                    if run_drift_diagnostics:
++                        logits_teacher, teacher_hidden = teacher_fwd_out
++                    else:
++                        logits_teacher, teacher_hidden = teacher_fwd_out, None
+                     soft_teach_preds = logits_teacher[pred_pos_mask].view(tot_mask_regions, k_toks, -1)
+                     hard_teach_preds = torch.argmax(soft_teach_preds, dim=-1)
+ 
++                    # DriftMTP Phase 2 (diagnostic-only): ECE (vs. hard teacher label) + per-horizon
++                    # MMD/Sinkhorn between student and teacher predictive states, at the anchor
++                    # horizon set {1,2,3,mid,k_toks}. Reuses this step's forward passes and the
++                    # same pred_pos_mask already used above; no extra forward pass, no extra
++                    # dataloader, no effect on `loss`/gradients/parameters. See
++                    # claudedriftingplan.md > Validation Metrics > Decided Implementation.
++                    if run_drift_diagnostics:
++                        drift_diagnostics = compute_training_diagnostics_fn(
++                            student_hidden_full=student_hidden,
++                            teacher_hidden_full=teacher_hidden,
++                            student_logits_full=soft_stud_preds,
++                            hard_teacher_labels_full=hard_teach_preds,
++                            pred_pos_mask=pred_pos_mask,
++                            tot_mask_regions=tot_mask_regions,
++                            k_toks=k_toks,
++                            bandwidth_schedule=mmd_bandwidth_schedule,
++                            step=state["iter_num"],
++                        )
++
+             if hparams.singleshot.last_region_loss_only:
+                 assert not (hparams.data == "pqds" and hparams.pqds.omit_tail_padding_in_loss), "Not supported to omit tail padding when using last_region_loss_only."
+                 # we consider only the last region per sequence for loss and metrics
+@@ -1628,6 +1687,9 @@ def fit(
+                 "consumed_toks_per_sec_per_device": consumed_toks_per_sec_per_device,
+             }
+             metrics.update(gt_forced_prefix_loss)
++            # DriftMTP Phase 2 (diagnostic-only): no-op dict {} on iterations where
++            # run_drift_diagnostics was False (disabled, off-cadence, or gt_teacher_supervision).
++            metrics.update(drift_diagnostics)
+             # extra metrics block
+             if hparams.singleshot.extra_train_metrics:
+                 metrics.update(stud_forced_teach_loss)

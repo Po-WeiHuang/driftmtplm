@@ -1,6 +1,6 @@
 model: hf
 model_args:
-  pretrained: /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/reproduce/step-00060000
+  pretrained: /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/reproduce
   dtype: float32
 
 trust_remote_code: true

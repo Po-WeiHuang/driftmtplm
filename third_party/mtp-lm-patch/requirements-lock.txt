@@ -151,6 +151,7 @@ Pygments==2.20.0
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 python-json-logger==4.1.0
+pytorch-ignite==0.5.5
 pytorch-lightning==2.6.5
 PyYAML==6.0.3
 pyzmq==27.1.0
@@ -167,6 +168,7 @@ safetensors==0.8.0
 scipy==1.17.1
 Send2Trash==2.1.0
 sentry-sdk==2.66.1
+setuptools==83.0.0
 shellingham==1.5.4
 six==1.17.0
 smmap==5.0.3
