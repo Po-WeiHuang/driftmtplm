@@ -1,6 +1,6 @@
 model: hf
 model_args:
-  pretrained: /data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/reproduce
+  pretrained: 
   dtype: float32
 
 trust_remote_code: true
@@ -24,6 +24,16 @@ gen_kwargs:
   return_mtp_result_dict: true
 
 batch_size: 1
+
+# Few-shot controls for the free-rollout pipeline.
+#   enable_fewshot: false  -> zero-shot; num_fewshot is ignored and warned about once.
+#   num_fewshot: N         -> exactly N demonstrations. This overrides the task
+#                             YAML's own count for every task run with this config;
+#                             set it to null to keep each task's default instead.
+# 8 is gsm8k_cot_singleshot's shipped count, so these values reproduce the
+# free-rollout behaviour this config had before the flag existed.
+enable_fewshot: false
+num_fewshot: 0
 
 output_path: ./outputs/lm_eval
 log_samples: true

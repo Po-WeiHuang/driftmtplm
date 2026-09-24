@@ -16,7 +16,6 @@ the generated files directly.
 import csv
 import argparse
 import os
-import shutil
 import stat
 import subprocess
 from itertools import product
@@ -40,6 +39,27 @@ RUN_NAME_BASE = "l3_magpie_metamath"
 EVAL_OUTPUT_BASE = "/data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/lm_eval/reproduce_step-00060000"
 ACCELERATE_CONFIG = "/home/huangp/aiproj/driftmtplm/third_party/lm-evaluation-harness-mtp-lm-patch/evaluation/config_hub/accelerate_config_1N.yaml"
 DEFAULT_MTP_CFG = "/home/huangp/aiproj/driftmtplm/third_party/lm-evaluation-harness-mtp-lm-patch/evaluation/config_hub/default_mtp.yaml"
+REPO_ROOT = "/home/huangp/aiproj/driftmtplm"
+
+# --- controlled-rollout diagnostic (docs/controlled_rollout_plan.md Phase 4) ---
+# Off by default: it needs a litgpt-format student AND a frozen teacher, which a
+# plain accuracy sweep does not have. Enable with --controlled-rollout and give
+# it both checkpoints.
+#
+# NOTE these are *litgpt* checkpoint dirs (lit_model.pth + model_config.yaml) --
+# NOT the HF dir that --ckpt-dir points at for `--model_args pretrained=`. They
+# are different directories and conflating them fails at load.
+CONTROLLED_ROLLOUT = False
+LITGPT_CKPT_DIR = None
+TEACHER_CKPT_DIR = None
+CR_TRUNCATION_LENGTH = 160   # hparams.singleshot.truncation_length
+CR_MASK_REGION_CT = 5        # hparams.singleshot.mask_region_ct -> region_width = 32
+CR_MICRO_BATCH_SIZE = 32     # hparams.train.micro_batch_size
+CR_OFFSET = 0                # region-grid alignment; abs(offset) < P
+CR_N_BINS = 15               # ECE bins (Guo et al. 2017 convention)
+CR_MAX_POOL_SAMPLES = None   # None = use the full per-horizon population
+CR_SEED = 0
+CR_LIMIT = None              # cap documents, for a quick smoke run
 
 parser = argparse.ArgumentParser(
     description="Generate and optionally submit the lm-eval HTCondor sweep."
@@ -51,9 +71,46 @@ parser.add_argument("--eval-output-base", default=EVAL_OUTPUT_BASE)
 parser.add_argument("--accelerate-config", default=ACCELERATE_CONFIG)
 parser.add_argument("--default-mtp-cfg", default=DEFAULT_MTP_CFG)
 parser.add_argument(
+    "--controlled-rollout",
+    action="store_true",
+    default=CONTROLLED_ROLLOUT,
+    help="also run the controlled-rollout diagnostic after lm_eval, into the same run dir.",
+)
+parser.add_argument(
+    "--litgpt-ckpt-dir",
+    default=LITGPT_CKPT_DIR,
+    help="student litgpt checkpoint dir (lit_model.pth + model_config.yaml). "
+         "NOT --ckpt-dir, which is the HF dir. Required with --controlled-rollout.",
+)
+parser.add_argument(
+    "--teacher-ckpt-dir",
+    default=TEACHER_CKPT_DIR,
+    help="frozen teacher litgpt checkpoint dir. Required with --controlled-rollout.",
+)
+parser.add_argument("--cr-truncation-length", type=int, default=CR_TRUNCATION_LENGTH,
+                    help="hparams.singleshot.truncation_length (default %(default)s)")
+parser.add_argument("--cr-mask-region-ct", type=int, default=CR_MASK_REGION_CT,
+                    help="hparams.singleshot.mask_region_ct (default %(default)s)")
+parser.add_argument("--cr-micro-batch-size", type=int, default=CR_MICRO_BATCH_SIZE,
+                    help="documents per forward pass (default %(default)s)")
+parser.add_argument("--cr-offset", type=int, default=CR_OFFSET,
+                    help="region-grid alignment, abs(offset) < P (default %(default)s)")
+parser.add_argument("--cr-n-bins", type=int, default=CR_N_BINS,
+                    help="ECE bin count (default %(default)s)")
+parser.add_argument("--cr-max-pool-samples", type=int, default=CR_MAX_POOL_SAMPLES,
+                    help="cap the per-horizon population for MMD/Sinkhorn (default: no cap)")
+parser.add_argument("--cr-seed", type=int, default=CR_SEED,
+                    help="only matters when --cr-max-pool-samples is set (default %(default)s)")
+parser.add_argument("--cr-limit", type=int, default=CR_LIMIT,
+                    help="evaluate only the first N documents (smoke runs)")
+parser.add_argument("--repo-root", default=REPO_ROOT,
+                    help="repo root, used for PYTHONPATH=<root>/src in the job script")
+parser.add_argument(
     "--save_condordir",
     default=None,
-    help="Also copy the generated .sh, .sub, and .items files into this directory.",
+    help="Write the generated .sh, .sub and .items into this directory instead of "
+         "condor/eval/. The .sub's executable points at the .sh beside it, so each "
+         "directory is a self-contained, independently submittable set.",
 )
 args = parser.parse_args()
 
@@ -65,12 +122,30 @@ RUN_NAME_BASE = args.run_name_base
 EVAL_OUTPUT_BASE = args.eval_output_base
 ACCELERATE_CONFIG = args.accelerate_config
 DEFAULT_MTP_CFG = args.default_mtp_cfg
+REPO_ROOT = args.repo_root
+CONTROLLED_ROLLOUT = args.controlled_rollout
+LITGPT_CKPT_DIR = args.litgpt_ckpt_dir
+TEACHER_CKPT_DIR = args.teacher_ckpt_dir
+CR_TRUNCATION_LENGTH = args.cr_truncation_length
+CR_MASK_REGION_CT = args.cr_mask_region_ct
+CR_MICRO_BATCH_SIZE = args.cr_micro_batch_size
+CR_OFFSET = args.cr_offset
+CR_N_BINS = args.cr_n_bins
+CR_MAX_POOL_SAMPLES = args.cr_max_pool_samples
+CR_SEED = args.cr_seed
+CR_LIMIT = args.cr_limit
+
+if CONTROLLED_ROLLOUT and not (LITGPT_CKPT_DIR and TEACHER_CKPT_DIR):
+    parser.error(
+        "--controlled-rollout needs both --litgpt-ckpt-dir and --teacher-ckpt-dir "
+        "(litgpt-format dirs with lit_model.pth + model_config.yaml, not the HF --ckpt-dir)."
+    )
 
 # --- swept over ---
 TASKS = [
     "gsm8k_cot_singleshot",
-    "aime25",
-    "bbh_cot_fewshot",
+    #"aime25",
+    #"bbh_cot_fewshot",
     # "ifeval",
     # "gpqa_main_cot_n_shot",
 ]
@@ -88,7 +163,7 @@ UNTIL_BY_TASK = {
     # separated, so it also stops at "\n\n" (the literal backslash-n pair is
     # what lm_eval's gen_kwargs parser unescapes into a real newline).
     "gsm8k_cot_singleshot": f"Q:+{EOS_UNTIL}",
-    "bbh_cot_fewshot": f"\\n\\n+Q:+{EOS_UNTIL}",
+    #"bbh_cot_fewshot": f"\\n\\n+Q:+{EOS_UNTIL}",
 }
 # everything else (aime25, ...) just stops at the EOS-ish tokens
 DEFAULT_UNTIL = EOS_UNTIL
@@ -132,9 +207,61 @@ REQUEST_MEMORY = "32G"
 
 # fmt: on
 
+# --save_condordir, when given, IS the output directory -- not a copy
+# destination. Generating straight into it is what keeps the .sub's `executable`
+# pointing at the .sh beside it; copying instead left the copy's `executable`
+# baked to condor/eval/, so submitting it silently ran whatever model that
+# directory happened to hold. It also stops a run for one checkpoint from
+# overwriting condor/eval/ for another -- each model gets its own directory.
+if args.save_condordir is not None:
+    EVAL_DIR = args.save_condordir
+
 SH_PATH = os.path.join(EVAL_DIR, "eval_reproduce_sweep.sh")
 SUB_PATH = os.path.join(EVAL_DIR, "eval_reproduce_sweep.sub")
 ITEMS_PATH = os.path.join(EVAL_DIR, "eval_reproduce_sweep.items")
+
+# The controlled-rollout step, spliced into the job script only when enabled.
+# `|| CONTROLLED_FAILED=1` is load-bearing: `set -euo pipefail` is on, so without
+# it a crash here aborts the job BEFORE the pusher runs and the free-rollout
+# accuracy numbers are lost. A diagnostic must never be able to destroy a
+# benchmark result.
+#
+# $TASK / $K_TOKS / $STRATEGY / $EVAL_OUTPUT_DIR are the SAME shell variables the
+# lm_eval invocation above uses -- that is what enforces "controlled rollout must
+# match free rollout", with no second place to edit and get wrong.
+if CONTROLLED_ROLLOUT:
+    _cr_optional = ""
+    if CR_MAX_POOL_SAMPLES is not None:
+        _cr_optional += f" \\\n    --max-pool-samples {CR_MAX_POOL_SAMPLES}"
+    if CR_LIMIT is not None:
+        _cr_optional += f" \\\n    --limit {CR_LIMIT}"
+    CONTROLLED_ROLLOUT_BLOCK = f"""
+# --- controlled-rollout diagnostic (docs/controlled_rollout_plan.md) ---------
+# Writes controlled_rollout_<timestamp>.json into the SAME $EVAL_OUTPUT_DIR that
+# lm_eval wrote results_*.json into, so one pusher call logs both rollouts into
+# one wandb run. NOTE --student-checkpoint is a litgpt dir, not $CKPT_DIR (HF).
+CONTROLLED_FAILED=0
+PYTHONPATH="{REPO_ROOT}/src:${{PYTHONPATH:-}}" python -u -m driftmtp.eval.condrollouteval \\
+    --config {DEFAULT_MTP_CFG} \\
+    --enabled \\
+    --student-checkpoint "{LITGPT_CKPT_DIR}" \\
+    --teacher-checkpoint "{TEACHER_CKPT_DIR}" \\
+    --task "${{TASK}}" \\
+    --k-toks "${{K_TOKS}}" \\
+    --strategy "${{STRATEGY}}" \\
+    --out-dir "${{EVAL_OUTPUT_DIR}}" \\
+    --truncation-length {CR_TRUNCATION_LENGTH} \\
+    --mask-region-ct {CR_MASK_REGION_CT} \\
+    --micro-batch-size {CR_MICRO_BATCH_SIZE} \\
+    --offset {CR_OFFSET} \\
+    --n-bins {CR_N_BINS} \\
+    --seed {CR_SEED}{_cr_optional} || CONTROLLED_FAILED=1
+if [ "$CONTROLLED_FAILED" -ne 0 ]; then
+    echo "WARNING: controlled rollout failed; pushing free-rollout metrics only." >&2
+fi
+"""
+else:
+    CONTROLLED_ROLLOUT_BLOCK = ""
 
 UNTIL_CASES = "".join(
     f'    {task}) UNTIL="{until}" ;;\n' for task, until in UNTIL_BY_TASK.items()
@@ -187,7 +314,7 @@ accelerate launch --config_file {ACCELERATE_CONFIG} -m lm_eval run \\
     --apply_chat_template \\
     --fewshot_as_multiturn \\
     --output_path "${{EVAL_OUTPUT_DIR}}"
-
+{CONTROLLED_ROLLOUT_BLOCK}
 exec python -u /home/huangp/aiproj/driftmtplm/third_party/mtp-lm/litgpt/scripts/push_lmeval_metrics_to_wandb.py \\
 --run_dir "${{EVAL_OUTPUT_DIR}}" \\
 --hf_tokenizer_path "${{CKPT_DIR}}" \\
@@ -247,12 +374,6 @@ with open(ITEMS_PATH, "w") as f:
 
 with open(SUB_PATH, "w") as f:
     f.write(SUB_TEMPLATE)
-
-if args.save_condordir is not None:
-    os.makedirs(args.save_condordir, exist_ok=True)
-    for generated_path in (SH_PATH, SUB_PATH, ITEMS_PATH):
-        shutil.copy2(generated_path, args.save_condordir)
-    print(f"copied generated Condor files to {args.save_condordir}")
 
 print(f"wrote {SH_PATH}")
 print(f"wrote {ITEMS_PATH} ({len(combos)} jobs)")
