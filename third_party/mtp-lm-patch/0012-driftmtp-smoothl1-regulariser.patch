@@ -1,0 +1,210 @@
+diff --git a/litgpt/args.py b/litgpt/args.py
+index f303517..2646c5f 100644
+--- a/litgpt/args.py
++++ b/litgpt/args.py
+@@ -404,6 +404,20 @@ class SingleShotArgs:
+     (claudedriftingplan.md > Column-Normalization Toggle). True (default) uses Algorithm 2's
+     row+column geometric-mean affinity; False uses Eq. 8's separately-normalized affinity."""
+ 
++    smoothl1_enabled: bool = False
++    """Add lambda_SL1 * L_SL1 (per-horizon Smooth-L1 of student predictive states onto the
++    stopped-gradient teacher states; see src/driftmtp/training.py compute_smoothl1_loss and
++    claudesmoothL1plan.md). Mutually exclusive with drift_enabled. Needs the student-forced
++    teacher pass, so incompatible with gt_teacher_supervision. smoothl1_weight=0.0 MUST
++    reproduce native MTP training exactly."""
++
++    smoothl1_weight: float = 0.0
++    """lambda_SL1, fixed. Default 0.0 is inert, mirroring drift_weight."""
++
++    smoothl1_beta_quantile: float = 0.9
++    """Quantile q of |student - teacher| that sets beta_j per horizon. beta_j is an EMA of
++    it during LR warmup and frozen afterwards. Must be in (0, 1)."""
++
+ 
+ def parse_temp_sep_token_id_range(temp_sep_token_id_range: str):
+     """'128011-128255' -> (128011, 128255)"""
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index 5ec499d..5b2939a 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -440,6 +440,24 @@ def compile_utilities(compile_mode=None):
+     # print("Skipping utility compilation for now.")
+ 
+ 
++def _validate_regulariser_flags(ss: SingleShotArgs) -> list:
++    """Reject invalid drift / Smooth-L1 combinations; return non-fatal warnings.
++
++    `raise`, not `assert`, so the check survives `python -O`. Standalone so it can be
++    tested without Fabric (tests/test_driftmtp_smoothl1.py). See claudesmoothL1plan.md.
++    """
++    if ss.drift_enabled and ss.smoothl1_enabled:
++        raise ValueError("drift_enabled and smoothl1_enabled are both True; enable at most one.")
++    if ss.smoothl1_enabled and not 0.0 < ss.smoothl1_beta_quantile < 1.0:
++        raise ValueError(f"smoothl1_beta_quantile must be in (0, 1), got {ss.smoothl1_beta_quantile}.")
++    warnings_out = []
++    if ss.drift_weight != 0.0 and not ss.drift_enabled:
++        warnings_out.append(f"drift_weight={ss.drift_weight} is ignored because drift_enabled=False.")
++    if ss.smoothl1_weight != 0.0 and not ss.smoothl1_enabled:
++        warnings_out.append(f"smoothl1_weight={ss.smoothl1_weight} is ignored because smoothl1_enabled=False.")
++    return warnings_out
++
++
+ def setup(
+     pdb: Optional[bool] = False,
+     model_name: Optional[str] = None,
+@@ -517,6 +535,9 @@ def setup(
+     hparams = capture_hparams()
+     # for ease of use and cleaner accessing, has a to_dict method if necessary
+     hparams = dict2attr(hparams)
++
++    # Before any model is built: drift and Smooth-L1 regularise the same states.
++    regulariser_warnings = _validate_regulariser_flags(hparams.singleshot)
+     
+     # FIXME there should be a more elegant way to do this, but I couldnt figure out the
+     # runtime call order for the dataclass inits versus the overrides via yaml and cmdline.
+@@ -639,6 +660,8 @@ def setup(
+     fabric.launch()
+ 
+     fabric.print(pprint.pformat(hparams.to_dict()))
++    for msg in regulariser_warnings:
++        fabric.print(f"WARNING: {msg}")
+     
+     # if logger_name in ("tensorboard", "wandb", "mlflow"):
+     fabric.logger.log_hyperparams(hparams.to_dict())
+@@ -825,6 +848,18 @@ def main(
+         "iter_num": 0,
+         "step_count": 0,
+     }
++    # Smooth-L1 beta_j lives in the checkpointed state, so a resumed run keeps its frozen
++    # beta instead of re-entering warmup estimation. Only added when enabled, so resuming
++    # a run without Smooth-L1 sees an unchanged state dict.
++    if hparams.singleshot.smoothl1_enabled:
++        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
++        if _driftmtp_src_dir not in sys.path:
++            sys.path.insert(0, _driftmtp_src_dir)
++        from driftmtp.training import SmoothL1BetaState
++        k_max = hparams.singleshot.k_toks.max_k_toks_value
++        if hparams.singleshot.k_toks_max is not None:
++            k_max = max(k_max, hparams.singleshot.k_toks_max.max_k_toks_value)
++        state["smoothl1_beta"] = SmoothL1BetaState(k_max=k_max, device=fabric.device)
+ 
+ 
+     resume = find_resume_path(fabric, resume, out_dir)
+@@ -1139,6 +1174,33 @@ def fit(
+         )
+         running_drift_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+ 
++    # Smooth-L1 feature regulariser (claudesmoothL1plan.md): same hook pattern and same
++    # constraints as the drift loss above, which it is mutually exclusive with.
++    smoothl1_enabled = hparams.singleshot.smoothl1_enabled
++    compute_smoothl1_loss_fn = None
++    extract_smoothl1_pair_fn = None
++    smoothl1_beta_state = None
++    smoothl1_accum_tracker = None
++    running_smoothl1_loss = None
++    if smoothl1_enabled:
++        assert not hparams.singleshot.gt_teacher_supervision, (
++            "singleshot.smoothl1_enabled requires the student-forced teacher pass, which "
++            "gt_teacher_supervision skips entirely."
++        )
++        assert not hparams.singleshot.last_region_loss_only, (
++            "singleshot.smoothl1_enabled + last_region_loss_only is not supported, for the same "
++            "reason as drift_enabled: pred_pos_mask/tot_mask_regions still cover all regions."
++        )
++        from driftmtp.training import SmoothL1AccumulationTracker
++        from driftmtp.training import compute_smoothl1_loss as compute_smoothl1_loss_fn
++        from driftmtp.training import extract_smoothl1_pair as extract_smoothl1_pair_fn
++        smoothl1_beta_state = state["smoothl1_beta"]
++        smoothl1_accum_tracker = SmoothL1AccumulationTracker(
++            window=train.gradient_accumulation_iters(devices, num_nodes),
++            weight=hparams.singleshot.smoothl1_weight,
++        )
++        running_smoothl1_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
++
+     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+     running_grad_norm = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+ 
+@@ -1215,7 +1277,7 @@ def fit(
+         # them: drift_enabled (every step) or run_drift_diagnostics (logged steps only, when
+         # diagnostics are on but drift training is off). gt_teacher_supervision is already
+         # asserted against at hook-resolution time for the drift-loss path.
+-        need_hidden_states = drift_enabled or run_drift_diagnostics
++        need_hidden_states = drift_enabled or smoothl1_enabled or run_drift_diagnostics
+ 
+         data_mask_prep_t0 = time.perf_counter()
+         train_data_len = train_data.shape[1] - 1
+@@ -1601,6 +1663,30 @@ def fit(
+                 total_loss = loss
+             drift_loss_t1 = time.perf_counter()
+ 
++            # Smooth-L1 (claudesmoothL1plan.md): L_total = L_MTP + lambda_SL1 * L_SL1. beta_j is an
++            # EMA updated every micro-step while the LR is warming up (get_lr's `it` is
++            # iter_num - 1 here, since iter_num was already incremented), then frozen once.
++            smoothl1_loss_t0 = time.perf_counter()
++            smoothl1_loss = torch.tensor(0.0, device=fabric.device)
++            if smoothl1_enabled:
++                if not smoothl1_beta_state.frozen and state["iter_num"] - 1 >= warmup_iters:
++                    smoothl1_beta_state.freeze(fabric)
++                sl1_x, sl1_y = extract_smoothl1_pair_fn(
++                    student_hidden_full=student_hidden,
++                    teacher_hidden_full=teacher_hidden,
++                    pred_pos_mask=pred_pos_mask,
++                    tot_mask_regions=tot_mask_regions,
++                    k_toks=k_toks,
++                )
++                smoothl1_beta_state.observe(
++                    (sl1_x.detach() - sl1_y).abs(), k_toks, hparams.singleshot.smoothl1_beta_quantile
++                )
++                smoothl1_result = compute_smoothl1_loss_fn(sl1_x, sl1_y, beta=smoothl1_beta_state.beta)
++                smoothl1_loss = smoothl1_result.loss
++                smoothl1_accum_tracker.update(smoothl1_result, k_toks)
++                total_loss = loss + hparams.singleshot.smoothl1_weight * smoothl1_loss
++            smoothl1_loss_t1 = time.perf_counter()
++
+             bwd_t0 = time.perf_counter()
+             fabric.backward(total_loss / train.gradient_accumulation_iters(devices, num_nodes))
+             bwd_t1 = time.perf_counter()
+@@ -1610,6 +1696,8 @@ def fit(
+         running_loss.update(loss_rank0)
+         if drift_enabled:
+             running_drift_loss.update(drift_loss.detach())
++        if smoothl1_enabled:
++            running_smoothl1_loss.update(smoothl1_loss.detach())
+ 
+         running_ce_teach_stud.update(ce_teach_stud.detach())
+         running_kl_teach_stud.update(kl_teach_stud.detach())
+@@ -1750,6 +1838,7 @@ def fit(
+                 "time_main_loss": main_loss_t1 - main_loss_t0,
+                 "time_prefix_loss": prefix_loss_t1 - prefix_loss_t0,
+                 "time_drift_loss": drift_loss_t1 - drift_loss_t0,
++                "time_smoothl1_loss": smoothl1_loss_t1 - smoothl1_loss_t0,
+                 "time_bwd": bwd_t1 - bwd_t0,
+                 "time_post_bwd": post_bwd_t1 - post_bwd_t0,
+                 "time_grad_clip": grad_clip_t1 - grad_clip_t0,
+@@ -1810,6 +1899,26 @@ def fit(
+                 }
+                 drift_metrics.update(drift_accum_tracker.compute(prefix="drift"))
+                 metrics.update(drift_metrics)
++            # Smooth-L1: global terms under `sl1/`, one wandb section per horizon under
++            # `sl1_h{j}/` (from the tracker). See claudesmoothL1plan.md > Metrics.
++            if smoothl1_enabled:
++                native_mtp_loss = loss_rank0.item()
++                mean_sl1_loss = running_smoothl1_loss.compute().item()
++                sl1_lambda = hparams.singleshot.smoothl1_weight
++                weighted_sl1_loss = sl1_lambda * mean_sl1_loss
++                sl1_total_loss = native_mtp_loss + weighted_sl1_loss
++                sl1_metrics = {
++                    "sl1/native_mtp_loss": native_mtp_loss,
++                    "sl1/loss": mean_sl1_loss,
++                    "sl1/loss_weighted": weighted_sl1_loss,
++                    "sl1/total_loss": sl1_total_loss,
++                    "sl1/lambda": sl1_lambda,
++                    "sl1/ratio_weighted_to_native": weighted_sl1_loss / (abs(native_mtp_loss) + 1e-8),
++                    "sl1/ratio_native_to_total": native_mtp_loss / (abs(sl1_total_loss) + 1e-8),
++                    "sl1/ratio_weighted_to_total": weighted_sl1_loss / (abs(sl1_total_loss) + 1e-8),
++                }
++                sl1_metrics.update(smoothl1_accum_tracker.compute(smoothl1_beta_state))
++                metrics.update(sl1_metrics)
+             # extra metrics block
+             if hparams.singleshot.extra_train_metrics:
+                 metrics.update(stud_forced_teach_loss)

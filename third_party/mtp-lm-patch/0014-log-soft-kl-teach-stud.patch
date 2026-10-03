@@ -1,0 +1,42 @@
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index 3bfdaa1..77a8dc9 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -101,6 +101,22 @@ def pt_ce_plus_ent_loss(logits_student=None, logits_teacher=None, labels_teacher
+     return loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud
+ 
+ 
++@torch.no_grad()
++def soft_kl_teach_stud(logits_student, logits_teacher, chunk_size=256):
++    # Mean KL(p_teach || p_stud) over positions, for logging only.
++    # Same quantity as the soft branch of pt_ce_plus_ent_loss (ce_teach_stud - ent_teach), but
++    # summed directly as p_teach * (log p_teach - log p_stud) in fp32, which avoids that form's
++    # cancellation error under bf16-true. Row chunks keep the (rows x vocab) temporaries small.
++    stud_logits = logits_student.flatten(end_dim=-2) # (BxL)xV
++    teach_logits = logits_teacher.flatten(end_dim=-2) # (BxL)xV
++    total = torch.zeros((), device=stud_logits.device, dtype=torch.float32)
++    for stud_chunk, teach_chunk in zip(stud_logits.split(chunk_size), teach_logits.split(chunk_size)):
++        log_p_teach = F.log_softmax(teach_chunk.float(), dim=-1)
++        log_p_stud = F.log_softmax(stud_chunk.float(), dim=-1)
++        total += (log_p_teach.exp() * (log_p_teach - log_p_stud)).sum()
++    return total / stud_logits.shape[0]
++
++
+ def batch_find_subarray(batch_tensor, sub_tensor):
+     # batch_tensor: [Batch, SeqLength]
+     # sub_tensor: [SubLength]
+@@ -1702,6 +1718,14 @@ def fit(
+             running_smoothl1_loss.update(smoothl1_loss.detach())
+ 
+         running_ce_teach_stud.update(ce_teach_stud.detach())
++        # kl_teach_stud is always logged as the soft KL(p_teach || p_stud) over every predicted
++        # position, whatever the supervision mode: the loss's own value is the hard-label CE under
++        # hard_teacher_supervision and covers only the matched positions under
++        # hard_self_teacher_supervision. Computed after backward so it adds nothing to peak memory.
++        # gt_teacher_supervision skips the teacher pass, so there are no teacher logits and the
++        # loss's value (CE against the ground truth) is logged unchanged.
++        if not hparams.singleshot.gt_teacher_supervision:
++            kl_teach_stud = soft_kl_teach_stud(soft_stud_preds, soft_teach_preds)
+         running_kl_teach_stud.update(kl_teach_stud.detach())
+         running_ent_teach.update(ent_teach.detach())
+         running_ent_stud.update(ent_stud.detach())

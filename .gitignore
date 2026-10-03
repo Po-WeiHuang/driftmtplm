@@ -19,3 +19,4 @@ src/driftmtp/metrics/__pycache__/
 claudemetricsplan.md
 third_party/mtp-lm-patch/config_hub/pretrain
 src/driftmtp/eval/__pycache__/
+src/driftmtp/__pycache__

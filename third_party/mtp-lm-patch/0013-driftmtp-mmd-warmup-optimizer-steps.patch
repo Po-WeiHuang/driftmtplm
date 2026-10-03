@@ -1,0 +1,44 @@
+diff --git a/litgpt/args.py b/litgpt/args.py
+index 2646c5f..bfcb3e2 100644
+--- a/litgpt/args.py
++++ b/litgpt/args.py
+@@ -340,15 +340,15 @@ class SingleShotArgs:
+     (pre-DriftMTP) training behavior."""
+ 
+     drift_diagnostics_mmd_warmup_steps: int = 2000
+-    """DriftMTP Phase 2: number of training iterations (state["iter_num"], NOT optimizer steps
+-    or diagnostic-call count) over which the shared MMD kernel bandwidth is recomputed from
+-    horizon-1 features on each diagnostic step; frozen at its last value for every iteration
+-    after this. Deliberately independent of train.lr_warmup_steps (a different concept -- LR
+-    schedule vs. kernel-scale stabilization), not derived from it. Must be several multiples of
+-    log_iter_interval (train.log_interval * gradient_accumulation_iters) to actually let the
+-    bandwidth recompute more than once before freezing, since diagnostics -- and therefore
+-    bandwidth updates -- only run on log_iter_interval-aligned iterations. See
+-    src/driftmtp/metrics/mmd.py (MMDBandwidthSchedule) for the policy this implements."""
++    """DriftMTP Phase 2: number of OPTIMIZER steps (state["step_count"], the same unit as
++    train.lr_warmup_steps; NOT micro-iterations or diagnostic-call count) over which the shared
++    MMD kernel bandwidth is recomputed from horizon-1 features on each diagnostic step; frozen
++    at its last value for every step after this. Set it equal to train.lr_warmup_steps to
++    freeze the bandwidth when the LR warmup ends; it is not derived from it automatically.
++    Must be several multiples of train.log_interval to actually let the bandwidth recompute
++    more than once before freezing, since diagnostics -- and therefore bandwidth updates --
++    only run on logged steps. See src/driftmtp/metrics/mmd.py (MMDBandwidthSchedule) for the
++    policy this implements."""
+ 
+     drift_enabled: bool = False
+     """DriftMTP Phase 4: whether to add lambda_drift * L_drift^token (see
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index 5b2939a..3bfdaa1 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -1522,7 +1522,9 @@ def fit(
+                             tot_mask_regions=tot_mask_regions,
+                             k_toks=k_toks,
+                             bandwidth_schedule=mmd_bandwidth_schedule,
+-                            step=state["iter_num"],
++                            # Optimizer steps, the unit of drift_diagnostics_mmd_warmup_steps
++                            # (and of train.lr_warmup_steps).
++                            step=state["step_count"],
+                         )
+ 
+             if hparams.singleshot.last_region_loss_only:
