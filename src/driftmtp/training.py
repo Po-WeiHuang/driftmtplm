@@ -53,6 +53,7 @@ Implements `claudedriftingplan.md`'s PHASE 4 -- Training Integration:
   deliberately does not repeat that.
 """
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Sequence
@@ -280,4 +281,213 @@ class DriftAccumulationTracker:
             for tau in self.temperatures:
                 if tau in self._anchor_mass_neg[j]:
                     emit(f"mass_neg_tau_{tau}_h{j}", self._anchor_mass_neg[j][tau])
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Smooth-L1 feature regulariser (EAGLE-style), see claudesmoothL1plan.md.
+# Mutually exclusive with the drift loss above: both regularise the same
+# predictive states, but Smooth-L1 is paired (student r,j -> teacher r,j) with
+# a per-horizon adaptive beta_j instead of an unpaired kernel field.
+# ---------------------------------------------------------------------------
+
+# Floor on beta_j. A zero beta (student == teacher exactly) would put a 0/0 in
+# the L2 branch of torch.where, whose NaN leaks into the backward pass even
+# when that branch is not selected.
+SMOOTHL1_BETA_MIN = 1e-6
+
+# Warmup EMA decay for beta_j, applied once per micro-step. Time constant
+# 1/(1-decay) = 10 micro-steps: averages out single-batch quantile noise while
+# tracking the error scale closely, so the frozen beta reflects the last few
+# warmup steps. 0.0 means last batch only.
+SMOOTHL1_BETA_EMA_DECAY = 0.9
+
+# torch.quantile refuses inputs above 2**24 elements; fall back to kthvalue.
+_QUANTILE_MAX_NUMEL = 2**24
+
+
+@dataclass
+class SmoothL1LossResult:
+    loss: torch.Tensor  # scalar, grad through the student only
+    per_horizon_loss: torch.Tensor  # (k,), detached, unweighted
+    per_horizon_mse: torch.Tensor  # (k,), detached, for reference only
+    per_horizon_frac_l1: torch.Tensor  # (k,), detached: fraction of elements with |e| >= beta_j
+
+
+def extract_smoothl1_pair(
+    student_hidden_full: torch.Tensor,
+    teacher_hidden_full: torch.Tensor,
+    pred_pos_mask: torch.Tensor,
+    tot_mask_regions: int,
+    k_toks: int,
+):
+    """(R, k, d_h) fp32 student states (grad-carrying) and detached teacher states.
+
+    Sliced once per step and shared by `SmoothL1BetaState.observe` and
+    `compute_smoothl1_loss`, so beta_j is estimated on exactly the errors the loss sees.
+    """
+    x = extract_predictive_states(
+        student_hidden_full, pred_pos_mask, tot_mask_regions, k_toks
+    ).float()
+    y = extract_predictive_states(
+        teacher_hidden_full, pred_pos_mask, tot_mask_regions, k_toks
+    ).detach().float()
+    return x, y
+
+
+def compute_smoothl1_loss(x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor) -> SmoothL1LossResult:
+    """L_SL1 = mean_{r,j,d} SmoothL1_{beta_j}(x - sg(y)), with a separate beta_j per horizon.
+
+    `F.smooth_l1_loss` only takes a scalar beta, hence the explicit `torch.where`.
+    Mean over d_h, so the loss scale does not depend on model width.
+    """
+    k_toks = x.shape[1]
+    err = x - y.detach()
+    b = beta[:k_toks].detach().to(err).clamp_min(SMOOTHL1_BETA_MIN).view(1, k_toks, 1)
+    abs_e = err.abs()
+    is_l1 = abs_e >= b
+    elem = torch.where(is_l1, abs_e - 0.5 * b, 0.5 * err.pow(2) / b)
+    loss = elem.mean()
+    with torch.no_grad():
+        return SmoothL1LossResult(
+            loss=loss,
+            per_horizon_loss=elem.detach().mean(dim=(0, 2)),
+            per_horizon_mse=err.detach().pow(2).mean(dim=(0, 2)),
+            per_horizon_frac_l1=is_l1.float().mean(dim=(0, 2)),
+        )
+
+
+def _quantile(values: torch.Tensor, q: float) -> torch.Tensor:
+    flat = values.reshape(-1).float()
+    if flat.numel() <= _QUANTILE_MAX_NUMEL:
+        return torch.quantile(flat, q)
+    k = min(max(1, math.ceil(q * flat.numel())), flat.numel())
+    return flat.kthvalue(k).values
+
+
+class SmoothL1BetaState:
+    """Per-horizon beta_j from Q_q(|x_j - y_j|): during LR warmup, an EMA of the
+    per-micro-step quantile; then frozen (DDP-averaged over the ranks that observed
+    each horizon).
+
+    The EMA is seeded: the first observation of horizon j sets beta_j = q_j outright,
+    and later ones blend in as beta_j <- d * beta_j + (1 - d) * q_j. So beta_j never
+    starts from the arbitrary initial value. The EMA is rank-local, like the batches it
+    is fed.
+
+    A horizon not seen before the freeze is estimated on its first observation (one
+    batch, no EMA) and then fixed. That late estimate is rank-local: with random per-rank
+    k_toks the other ranks may not see the horizon on the same step, so no collective can
+    be issued.
+
+    Implements `state_dict`/`load_state_dict`, so Fabric checkpoints it as part of the
+    training `state` dict and a resumed run keeps its EMA and frozen beta.
+    """
+
+    def __init__(self, k_max: int, device=None, ema_decay: float = SMOOTHL1_BETA_EMA_DECAY):
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
+        self.ema_decay = ema_decay
+        self.beta = torch.ones(k_max, device=device)
+        self.seen = torch.zeros(k_max, dtype=torch.bool, device=device)
+        self.frozen = False
+
+    @torch.no_grad()
+    def observe(self, err_abs: torch.Tensor, k_toks: int, q: float) -> None:
+        if k_toks > self.beta.numel():
+            raise ValueError(f"k_toks ({k_toks}) exceeds k_max ({self.beta.numel()})")
+        d = self.ema_decay
+        for j in range(k_toks):
+            if self.frozen and self.seen[j]:
+                continue
+            q_j = _quantile(err_abs[:, j, :], q)
+            # Unseen horizon (first warmup observation, or first after the freeze):
+            # take q_j outright. Seen horizon during warmup: EMA update.
+            new = torch.where(self.seen[j], d * self.beta[j] + (1.0 - d) * q_j, q_j)
+            self.beta[j] = new.clamp_min(SMOOTHL1_BETA_MIN)
+            self.seen[j] = True
+
+    @torch.no_grad()
+    def freeze(self, fabric=None) -> None:
+        """Freeze beta. With `fabric` and world_size > 1, first replace each seen beta_j
+        by its mean over the ranks that observed horizon j. Collective: every rank must
+        call this on the same iteration."""
+        if fabric is not None and fabric.world_size > 1:
+            seen_f = self.seen.float()
+            beta_sum = fabric.all_reduce(self.beta * seen_f, reduce_op="sum")
+            count = fabric.all_reduce(seen_f, reduce_op="sum")
+            observed = count > 0
+            self.beta = torch.where(observed, beta_sum / count.clamp_min(1.0), self.beta)
+            self.seen = observed
+        self.frozen = True
+
+    def state_dict(self) -> Dict:
+        return {"beta": self.beta.clone(), "seen": self.seen.clone(), "frozen": self.frozen}
+
+    def load_state_dict(self, state: Dict) -> None:
+        # beta is the EMA itself, so older checkpoints (and the extra `ema`/`count` keys
+        # of the bias-corrected variant) resume without conversion.
+        self.beta = state["beta"].to(self.beta.device, self.beta.dtype)
+        self.seen = state["seen"].to(self.seen.device, torch.bool)
+        self.frozen = bool(state["frozen"])
+
+
+class SmoothL1AccumulationTracker:
+    """Window over one optimizer step's micro-substeps, same anchor-horizon and pruning
+    policy as `DriftAccumulationTracker`. Emits one wandb section per horizon
+    (`sl1_h{j}/...`) plus the pooled `sl1/pct_l1`."""
+
+    _STATS = ("loss", "loss_weighted", "mse", "pct_l1", "pct_l2")
+
+    def __init__(self, window: int, weight: float):
+        self.window = window
+        self.weight = weight
+        self._pct_l1_pooled: deque = deque(maxlen=window)
+        self._anchor: Dict[int, Dict[str, deque]] = {}
+
+    def update(self, result: SmoothL1LossResult, k_toks: int) -> None:
+        if result.per_horizon_loss.numel() != k_toks:
+            raise ValueError(
+                f"result has {result.per_horizon_loss.numel()} horizons, expected k_toks={k_toks}"
+            )
+        loss = result.per_horizon_loss.tolist()
+        mse = result.per_horizon_mse.tolist()
+        pct_l1 = (100.0 * result.per_horizon_frac_l1).tolist()
+        self._pct_l1_pooled.append(sum(pct_l1) / k_toks)
+
+        anchors = anchor_horizons(k_toks)
+        for j in set(self._anchor) - set(anchors):
+            del self._anchor[j]
+        for j in anchors:
+            values = {
+                "loss": loss[j - 1],
+                "loss_weighted": self.weight * loss[j - 1],
+                "mse": mse[j - 1],
+                "pct_l1": pct_l1[j - 1],
+                "pct_l2": 100.0 - pct_l1[j - 1],
+            }
+            slots = self._anchor.setdefault(
+                j, {s: deque(maxlen=self.window) for s in self._STATS}
+            )
+            for name, value in values.items():
+                slots[name].append(value)
+
+    def compute(self, beta_state: SmoothL1BetaState) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+
+        def emit(key: str, values: Sequence[float]) -> None:
+            stats = _mean_std_ratio(values)
+            out[f"{key}_mean"] = stats["mean"]
+            out[f"{key}_std"] = stats["std"]
+
+        if self._pct_l1_pooled:
+            emit("sl1/pct_l1", self._pct_l1_pooled)
+        for j in sorted(self._anchor):
+            for name in self._STATS:
+                emit(f"sl1_h{j}/{name}", self._anchor[j][name])
+        # beta for every horizon ever seen, not just anchors: it is state, not a
+        # per-step statistic, so it never goes stale.
+        for idx in torch.nonzero(beta_state.seen).flatten().tolist():
+            out[f"sl1_h{idx + 1}/beta"] = beta_state.beta[idx].item()
+        out["sl1/beta_frozen"] = float(beta_state.frozen)
         return out

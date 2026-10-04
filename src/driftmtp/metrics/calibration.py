@@ -201,6 +201,49 @@ def ece_bin_stats(
 
 
 @torch.no_grad()
+def band_accuracies(
+    confidences: torch.Tensor,
+    correctness: dict[str, torch.Tensor],
+    n_bins: int = 15,
+) -> list[dict]:
+    """Per-bin accuracy of several correctness labels over one confidence population.
+
+    The bins are `_bin_table`'s, i.e. exactly `ece_from_pairs`'s, so a band's
+    `acc_<name>` is the `acc(B_m)` the matching ECE compares against
+    `conf(B_m)`. Every label is binned by the **same** confidences, so the bins
+    and their counts are shared and only the accuracies differ.
+
+    Args:
+        confidences: (N,) float confidences in `[0, 1]`.
+        correctness: name -> (N,) float correctness labels, e.g.
+            `{"stud_gt": ..., "stud_teach": ...}`.
+        n_bins: must match the `n_bins` the ECE was computed with.
+
+    Returns:
+        One dict per **non-empty** bin, in bin order: `lo` and `hi` (the bin's
+        edges), `n` (its count) and `acc_<name>` for every label. No count floor
+        is applied here; the caller decides how many samples are enough.
+    """
+    for name, corr in correctness.items():
+        if corr.shape != confidences.shape:
+            raise ValueError(
+                f"correctness[{name!r}] must match confidences' shape "
+                f"{tuple(confidences.shape)}, got {tuple(corr.shape)}"
+            )
+
+    names = list(correctness)
+    tables = [_bin_table(confidences, correctness[name], n_bins=n_bins) for name in names]
+    bands = []
+    for rows in zip(*tables):
+        i = rows[0]["bin"]
+        band = {"lo": i / n_bins, "hi": (i + 1) / n_bins, "n": rows[0]["count"]}
+        for name, row in zip(names, rows):
+            band[f"acc_{name}"] = row["acc"]
+        bands.append(band)
+    return bands
+
+
+@torch.no_grad()
 def expected_calibration_error(
     logits: torch.Tensor,
     labels: torch.Tensor,

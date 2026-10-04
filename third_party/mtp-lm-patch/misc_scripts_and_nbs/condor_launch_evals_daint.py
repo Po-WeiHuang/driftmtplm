@@ -54,9 +54,10 @@ LITGPT_CKPT_DIR = None
 TEACHER_CKPT_DIR = None
 CR_TRUNCATION_LENGTH = 160   # hparams.singleshot.truncation_length
 CR_MASK_REGION_CT = 5        # hparams.singleshot.mask_region_ct -> region_width = 32
-CR_MICRO_BATCH_SIZE = 32     # hparams.train.micro_batch_size
+CR_MICRO_BATCH_SIZE = None   # docs per forward pass; None = take it from --default-mtp-cfg (32)
 CR_OFFSET = 0                # region-grid alignment; abs(offset) < P
-CR_N_BINS = 15               # ECE bins (Guo et al. 2017 convention)
+CR_N_BINS = None             # ECE bins; None = take it from --default-mtp-cfg (15)
+CR_MIN_BAND_SAMPLES = None   # confband accuracy floor; None = take it from --default-mtp-cfg (220)
 CR_MAX_POOL_SAMPLES = None   # None = use the full per-horizon population
 CR_SEED = 0
 CR_LIMIT = None              # cap documents, for a quick smoke run
@@ -92,11 +93,16 @@ parser.add_argument("--cr-truncation-length", type=int, default=CR_TRUNCATION_LE
 parser.add_argument("--cr-mask-region-ct", type=int, default=CR_MASK_REGION_CT,
                     help="hparams.singleshot.mask_region_ct (default %(default)s)")
 parser.add_argument("--cr-micro-batch-size", type=int, default=CR_MICRO_BATCH_SIZE,
-                    help="documents per forward pass (default %(default)s)")
+                    help="documents per forward pass "
+                         "(default: metadata.controlled_rollout.micro_batch_size in --default-mtp-cfg)")
 parser.add_argument("--cr-offset", type=int, default=CR_OFFSET,
                     help="region-grid alignment, abs(offset) < P (default %(default)s)")
 parser.add_argument("--cr-n-bins", type=int, default=CR_N_BINS,
-                    help="ECE bin count (default %(default)s)")
+                    help="ECE bin count "
+                         "(default: metadata.controlled_rollout.n_bins in --default-mtp-cfg)")
+parser.add_argument("--cr-min-band-samples", type=int, default=CR_MIN_BAND_SAMPLES,
+                    help="omit a confidence band's accuracies below this n "
+                         "(default: metadata.controlled_rollout.min_band_samples in --default-mtp-cfg)")
 parser.add_argument("--cr-max-pool-samples", type=int, default=CR_MAX_POOL_SAMPLES,
                     help="cap the per-horizon population for MMD/Sinkhorn (default: no cap)")
 parser.add_argument("--cr-seed", type=int, default=CR_SEED,
@@ -131,6 +137,7 @@ CR_MASK_REGION_CT = args.cr_mask_region_ct
 CR_MICRO_BATCH_SIZE = args.cr_micro_batch_size
 CR_OFFSET = args.cr_offset
 CR_N_BINS = args.cr_n_bins
+CR_MIN_BAND_SAMPLES = args.cr_min_band_samples
 CR_MAX_POOL_SAMPLES = args.cr_max_pool_samples
 CR_SEED = args.cr_seed
 CR_LIMIT = args.cr_limit
@@ -231,6 +238,12 @@ ITEMS_PATH = os.path.join(EVAL_DIR, "eval_reproduce_sweep.items")
 # match free rollout", with no second place to edit and get wrong.
 if CONTROLLED_ROLLOUT:
     _cr_optional = ""
+    if CR_MICRO_BATCH_SIZE is not None:
+        _cr_optional += f" \\\n    --micro-batch-size {CR_MICRO_BATCH_SIZE}"
+    if CR_N_BINS is not None:
+        _cr_optional += f" \\\n    --n-bins {CR_N_BINS}"
+    if CR_MIN_BAND_SAMPLES is not None:
+        _cr_optional += f" \\\n    --min-band-samples {CR_MIN_BAND_SAMPLES}"
     if CR_MAX_POOL_SAMPLES is not None:
         _cr_optional += f" \\\n    --max-pool-samples {CR_MAX_POOL_SAMPLES}"
     if CR_LIMIT is not None:
@@ -252,9 +265,7 @@ PYTHONPATH="{REPO_ROOT}/src:${{PYTHONPATH:-}}" python -u -m driftmtp.eval.condro
     --out-dir "${{EVAL_OUTPUT_DIR}}" \\
     --truncation-length {CR_TRUNCATION_LENGTH} \\
     --mask-region-ct {CR_MASK_REGION_CT} \\
-    --micro-batch-size {CR_MICRO_BATCH_SIZE} \\
     --offset {CR_OFFSET} \\
-    --n-bins {CR_N_BINS} \\
     --seed {CR_SEED}{_cr_optional} || CONTROLLED_FAILED=1
 if [ "$CONTROLLED_FAILED" -ne 0 ]; then
     echo "WARNING: controlled rollout failed; pushing free-rollout metrics only." >&2
