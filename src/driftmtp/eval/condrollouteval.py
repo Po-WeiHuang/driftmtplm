@@ -6,7 +6,8 @@ This is a **diagnostic, not a scorer**. Free rollout (`lm_eval`) measures
 whether answers are correct; this harness never scores answers. It runs the
 student and the teacher over held-out documents in *training's own MTP
 layout* and reports, per horizon, `ece_stud_gt`, `ece_stud_teach`, `mmd`
-and `sinkhorn` — each ECE in both a marginal and a joint (whole-block) form.
+and `sinkhorn` — each ECE in both a marginal and a joint (whole-block) form —
+plus the student's accuracy in each of the marginal ECE's confidence bands.
 
 Phase 2 scope: load litgpt student/teacher checkpoints, load held-out
 documents from the same `lm_eval` task free rollout evaluates on, lay them
@@ -1219,6 +1220,89 @@ def aggregate_horizons(records: List[Dict], pooled: Dict[str, torch.Tensor]) -> 
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — accuracy per confidence band
+# ---------------------------------------------------------------------------
+
+
+# The shipped band floor: min_band_samples_for(15) = 217, rounded up to 220.
+DEFAULT_MIN_BAND_SAMPLES = 220
+
+
+def min_band_samples_for(n_bins: int, z: float = 1.96) -> int:
+    """Default band floor: the smallest count whose accuracy is known to within one band.
+
+    A band's accuracy is a binomial proportion, so its 95% interval has
+    half-width `z * sqrt(p(1-p)/n)`, at most `z * 0.5 / sqrt(n)` (at p = 0.5).
+    Requiring that to be no wider than the band itself, `1 / n_bins`, gives
+    `n >= (z * 0.5 * n_bins)^2` — 217 at the shipped 15 bins, i.e. ±6.7
+    points; `DEFAULT_MIN_BAND_SAMPLES` rounds that up to 220 (±6.6 points).
+    Below it the accuracy is not pinned down even to its own band, so
+    it cannot say whether the student is over- or under-confident there.
+
+    | n | worst-case 95% half-width |
+    |---|---|
+    | 30 | ±0.179 |
+    | 100 | ±0.098 |
+    | 217 | ±0.067 |
+    | 500 | ±0.044 |
+    | 1000 | ±0.031 |
+    """
+    import math
+
+    return math.ceil((z * 0.5 * n_bins) ** 2)
+
+
+@torch.no_grad()
+def confband_records(
+    pooled: Dict[str, torch.Tensor],
+    n_bins: int = 15,
+    min_band_samples: Optional[int] = DEFAULT_MIN_BAND_SAMPLES,
+) -> Dict[str, Dict]:
+    """Student accuracy vs. the true token and vs. the teacher, per horizon and confidence band.
+
+    Each horizon's tokens are split by the student's own top-1 confidence into
+    the **same** bins its marginal ECE uses (`band_accuracies` ->
+    `_bin_table`). Per band:
+
+    | Field | Definition |
+    |---|---|
+    | `n` | tokens in the band |
+    | `acc_stud_gt` | share where the student's prediction is the true token |
+    | `acc_stud_teach` | share where it is the teacher's argmax |
+
+    Keyed `horizon_{j}_confband_{lo}_{hi}` with 3-decimal edges, e.g.
+    `horizon_3_confband_0.600_0.667`. One value per band for the whole
+    held-out set — the pooled population, never a per-document mean.
+
+    The population is `marginal_pairs`', so `selected_mask` gates it exactly as
+    it gates the ECE: under `conf_adapt` every band below the threshold is empty
+    for `j >= 2`. Empty bands are omitted. A band with fewer than
+    `min_band_samples` tokens keeps `n` but carries no accuracy — the same
+    "omit the metric, keep the count" rule as the per-horizon floors. Default
+    220 (`DEFAULT_MIN_BAND_SAMPLES`); `None` derives the floor from `n_bins`
+    instead (`min_band_samples_for`, 217 at 15 bins).
+    """
+    from ..metrics.calibration import band_accuracies
+
+    if min_band_samples is None:
+        min_band_samples = min_band_samples_for(n_bins)
+
+    out: Dict[str, Dict] = {}
+    for j in range(1, pooled["confidence"].shape[1] + 1):
+        confidence, correct_gt = marginal_pairs(pooled, j, "gt")
+        _, correct_teach = marginal_pairs(pooled, j, "teach")
+        for band in band_accuracies(
+            confidence, {"stud_gt": correct_gt, "stud_teach": correct_teach}, n_bins=n_bins
+        ):
+            entry = {"n": band["n"]}
+            if band["n"] >= min_band_samples:
+                entry["acc_stud_gt"] = band["acc_stud_gt"]
+                entry["acc_stud_teach"] = band["acc_stud_teach"]
+            out[f"horizon_{j}_confband_{band['lo']:.3f}_{band['hi']:.3f}"] = entry
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Phase 3 — write the file hop 3 reads
 # ---------------------------------------------------------------------------
 
@@ -1266,13 +1350,17 @@ def build_results_payload(
     mmd_bandwidth: Optional[float],
     student_checkpoint: str,
     teacher_checkpoint: str,
+    confband: Optional[Dict[str, Dict]] = None,
+    min_band_samples: Optional[int] = None,
 ) -> Dict:
     """Assemble the JSON payload, and refuse to build a non-finite one.
 
-    `per_horizon` is canonical; `aggregate` is derived from it. The naming of
-    the *wandb* keys is deliberately not decided here — hop 3
-    (`push_lmeval_metrics_to_wandb.py`) flattens this payload, which is where
-    every other metric in the pipeline is named.
+    `per_horizon` is canonical; `aggregate` is derived from it. `confband` is
+    `confband_records`' per-band accuracies, already keyed
+    `horizon_{j}_confband_{lo}_{hi}`, and `min_band_samples` the floor they
+    were reported under. The naming of the *wandb* keys is deliberately not
+    decided here — hop 3 (`push_lmeval_metrics_to_wandb.py`) flattens this
+    payload, which is where every other metric in the pipeline is named.
     """
     # Canonical `None` or `["conf_adapt", <threshold>]`. `list(strategy)` used
     # to sit in the dict below, which splits the *string* forms the sweep
@@ -1297,6 +1385,8 @@ def build_results_payload(
         "teacher_checkpoint": str(teacher_checkpoint),
         "per_horizon": records,
         "aggregate": aggregate,
+        "confband": {} if confband is None else confband,
+        "min_band_samples": min_band_samples,
     }
     _assert_finite(payload)
     return payload
@@ -1380,6 +1470,7 @@ def run_controlled_rollout(
     n_bins: int = 15,
     min_ece_samples: int = 300,
     min_latent_samples: int = 200,
+    min_band_samples: Optional[int] = DEFAULT_MIN_BAND_SAMPLES,
     max_pool_samples: Optional[int] = None,
     seed: int = 0,
     device=None,
@@ -1392,7 +1483,7 @@ def run_controlled_rollout(
     ```text
     batch_documents -> process_batch -> selected_mask -> HorizonAccumulator.add
                                                                   |
-                                                    per_horizon_records + aggregate
+                                          per_horizon_records + aggregate + confband_records
                                                                   |
                                                         the results payload
     ```
@@ -1438,6 +1529,9 @@ def run_controlled_rollout(
         min_latent_samples=min_latent_samples,
     )
     aggregate = aggregate_horizons(records, pooled)
+    if min_band_samples is None:
+        min_band_samples = min_band_samples_for(n_bins)
+    confband = confband_records(pooled, n_bins=n_bins, min_band_samples=min_band_samples)
 
     return build_results_payload(
         records,
@@ -1454,6 +1548,8 @@ def run_controlled_rollout(
         mmd_bandwidth=bandwidth,
         student_checkpoint=student_checkpoint,
         teacher_checkpoint=teacher_checkpoint,
+        confband=confband,
+        min_band_samples=min_band_samples,
     )
 
 
@@ -1495,6 +1591,7 @@ _CONFIG_DEFAULTS: Dict[str, object] = {
     "n_bins": 15,
     "min_ece_samples": 300,
     "min_latent_samples": 200,
+    "min_band_samples": DEFAULT_MIN_BAND_SAMPLES,  # 220; null -> min_band_samples_for(n_bins)
     "max_pool_samples": None,
     "seed": 0,
     "limit": None,
@@ -1620,6 +1717,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="omit a horizon's ECE fields below this n (default 300)")
     parser.add_argument("--min-latent-samples", "--min_latent_samples", dest="min_latent_samples", type=int,
                         help="omit a horizon's MMD and Sinkhorn below this n (default 200)")
+    parser.add_argument("--min-band-samples", "--min_band_samples", dest="min_band_samples", type=int,
+                        help="omit a confidence band's accuracies below this n "
+                             "(default 220)")
     parser.add_argument("--max-pool-samples", "--max_pool_samples", dest="max_pool_samples", type=int,
                         help="cap the per-horizon population for MMD/Sinkhorn; default is no cap")
     parser.add_argument("--seed", type=int)
@@ -1677,6 +1777,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         n_bins=config["n_bins"],
         min_ece_samples=config["min_ece_samples"],
         min_latent_samples=config["min_latent_samples"],
+        min_band_samples=config["min_band_samples"],
         max_pool_samples=config["max_pool_samples"],
         seed=config["seed"],
         student_checkpoint=config["student_checkpoint"],
@@ -1687,9 +1788,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"wrote {path}")
     for record in payload["per_horizon"]:
         print(f"  h{record['horizon']}: n={record['n_samples']} "
-              f"ece_gt={record['ece_stud_gt']:.4f} "
+              f"ece_gt={record.get('ece_stud_gt', float('nan')):.4f} "
               f"mmd={record.get('mmd', float('nan')):.4f} "
               f"sinkhorn={record.get('sinkhorn', float('nan')):.3f}")
+    bands = payload["confband"]
+    print(f"  confband: {sum('acc_stud_gt' in b for b in bands.values())}/{len(bands)} "
+          f"non-empty bands reported (min_band_samples={payload['min_band_samples']})")
     return 0
 
 

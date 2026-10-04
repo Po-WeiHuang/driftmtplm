@@ -37,3 +37,21 @@ num_fewshot: 0
 
 output_path: ./outputs/lm_eval
 log_samples: true
+
+# Controlled-rollout diagnostic (python -m driftmtp.eval.condrollouteval).
+# Must sit under `metadata`: lm_eval rejects unknown top-level keys. The launcher
+# (condor_launch_evals_daint.py) passes --enabled, the checkpoints, k_toks and
+# strategy itself; CLI flags override anything set here.
+metadata:
+  controlled_rollout:
+    # Documents (question + answer) per student/teacher forward pass. Speed and
+    # GPU memory only; the metrics do not depend on it.
+    micro_batch_size: 32
+    # ECE / confidence-band bin count (Guo et al. 2017 convention).
+    n_bins: 15
+    # A confidence band reports acc_stud_gt / acc_stud_teach only if it holds at
+    # least this many tokens; below it only the count `n` is written. 220 keeps
+    # the worst-case 95% error bar (+-0.98/sqrt(n)) at +-0.066, inside one of the
+    # 15 ECE bands (1/15 = 0.067). null -> derive from n_bins (217 at 15 bins).
+    # See docs/eval_pipeline/confband_accuracy.md.
+    min_band_samples: 220
