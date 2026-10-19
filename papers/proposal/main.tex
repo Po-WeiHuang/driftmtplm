@@ -3,6 +3,7 @@
 % Official template: https://neurips.cc/Conferences/2026/CallForPapers
 % Default: anonymous Main Track submission with line numbers.
 % For a non-anonymous draft, use \usepackage[preprint]{neurips_2026}.
+\PassOptionsToPackage{numbers,sort&compress}{natbib}
 \usepackage{neurips_2026}
 
 \usepackage[utf8]{inputenc}
@@ -14,54 +15,300 @@
 \usepackage{amsfonts}
 \usepackage{microtype}
 
-\title{Research Proposal Title}
+\title{Drift-Regularized Multi-Token Prediction via On-Policy Self-Distillation}
 
-% Author details are hidden in the default anonymous submission mode.
+% Author details and affiliation text copied from the supplied manuscript.
+% They are hidden in the default anonymous submission mode.
 \author{%
-  Author Name \\
-  Department, Institution \\
-  \texttt{author@example.com}
+  Po-Wei Huang, Feng-Ting Liao \\
+  Department of Computer Science, University of Oxford \\
+  MediaTek Research
 }
+
+% Adapted from the supplied July 2026 manuscript:
+% Multi_Token_Prediction_via_Self_Distillation_Drifting_Model_Revision_.pdf
+% Its numerical results are explicitly synthetic placeholders; this proposal
+% retains the motivation, method, and experimental plan without those results.
 
 \begin{document}
 
 \maketitle
 
-\begin{abstract}
-  Summarize the research problem, proposed approach, and expected contribution.
-\end{abstract}
+% \begin{abstract}
+% Standard autoregressive language models incur substantial latency by generating
+%  tokens strictly sequentially. Multi-token prediction (MTP) addresses this by
+% predicting a block of future tokens in a single forward pass. However, training
+% MTP models solely via token-level cross-entropy leaves a representation gap:
+% parallel hidden states lack explicit guidance on how to organize intermediate
+% predictive representations. We propose a drift-regularized self-distillation
+% framework that constructs a local conditional attraction--repulsion field to
+% align student hidden-state populations with teacher feature distributions.
+% Unlike paired mean squared error (MSE), this objective does not require
+% point-to-point Euclidean matching. We will test whether conditional drift
+% improves task accuracy, calibration, latent-space alignment, and the
+% accuracy--acceleration trade-off relative to token-only MTP and paired MSE.
+% \end{abstract}
 
 \section{objective}
 \label{sec:objective}
-State the research question, hypothesis, and measurable criteria for success.
+Standard next-token prediction generates one token per step, incurring high
+memory-bandwidth overhead and inference latency during long-form generation and
+reasoning-intensive tasks. MTP mitigates this bottleneck by generating a
+contiguous block of $k$ tokens in a single forward pass. We build on on-policy
+self-distillation, in which a student proposes future tokens at inserted mask
+positions and a frozen teacher supplies supervision conditioned on the
+student-generated continuation~\citep{kirchenbauer2026mtp}.
+
+Our objective is to reduce the capability loss that accompanies longer parallel
+prediction horizons. We will test the hypothesis that, at comparable realized
+acceleration, token-only MTP is outperformed by MTP with paired latent MSE,
+which is in turn outperformed by MTP with conditional drift. Success will be
+assessed through task scores relative to the original sequential teacher,
+confidence calibration, held-out feature-distribution diagnostics, and measured
+throughput and latency. This ordering is a hypothesis to be tested rather than
+an established result.
 
 \section{novelty}
 \label{sec:novelty}
-Explain how the proposed work advances prior research and identify its original
-contributions.
+A correct token prediction constrains relative logit margins without uniquely
+determining the hidden representation. Consequently, newly inserted MTP mask
+states must learn parallel future-token computations without explicit
+supervision over their representation geometry. Work on feature-based
+speculative decoding, including EAGLE~\citep{li2024eagle}, motivates addressing
+feature uncertainty; NextLat~\citep{teoh2025nextlatent} also provides motivation
+for auxiliary prediction in latent space.
+
+Paired MSE supplies dense supervision but imposes a one-to-one Euclidean match
+between each parallel student state and its sequential teacher counterpart.
+Our proposed contribution is to adapt population-level drifting
+\citep{deng2026drifting} to conditional MTP representation alignment. A local
+vector field attracts student states toward teacher feature neighborhoods and
+repels them from crowded student neighborhoods. Conditioning interactions on
+prediction horizon and prefix context is intended to preserve relevant local
+structure. We will compare horizon-wise alignment with block-level alignment
+to determine whether modeling inter-token feature dependencies improves chunk
+coherence.
 
 \section{impact}
 \label{sec:impact}
-Describe the expected scientific and practical benefits, intended beneficiaries,
-and broader implications.
+If successful, this approach could extend the usable parallel prediction horizon
+while retaining more of the sequential model's reasoning capability. The
+regularizer is applied during training and adds no inference module to the
+standalone MTP model. The intended practical benefit is improved generation
+quality at a given latency or greater throughput at a given quality target.
+These benefits require system measurements and cannot be inferred from the
+configured block size alone.
+
+The study will also provide a controlled comparison of output-only supervision,
+pointwise feature regression, and population-level feature alignment. Reporting
+calibration separately from latent distribution distances will help distinguish
+reliable confidence from representation matching. A later extension could apply
+the same conditional regularizer to a speculative drafter such as
+DFlash~\citep{chen2026dflash}; the initial study will focus on standalone MTP.
 
 \section{Methods}
 \label{sec:methods}
-Describe the proposed approach, data, baselines, experimental design, and
-evaluation metrics. Specify the analyses needed to test the hypothesis.
+
+\subsection{On-policy MTP self-distillation}
+For training region $r$, let $c_r$ denote a context prefix and $k_r$ the number
+of future predictions. Following~\citet{kirchenbauer2026mtp}, the flattened
+student input inserts $k_r-1$ trainable \texttt{<MTP>} mask tokens. Repeated
+position IDs and a blocked causal attention mask allow active prediction states
+to attend to the prefix and preceding masks without altering copied context
+representations. At horizon $j$, the student produces hidden state $u^S_{r,j}$
+and token distribution $p^S_{r,j}$. Its greedy proposal is
+$\hat y_{r,j}=\arg\max_v p^S_{r,j}(v)$.
+
+The frozen teacher is evaluated on the student-forced continuation:
+\begin{equation}
+  u^T_{r,j}=H_{\theta_T}(c_r,\hat y_{r,<j}),
+  \qquad
+  \bar y_{r,j}=\arg\max_v p_{\theta_T}(v\mid c_r,\hat y_{r,<j}).
+\end{equation}
+With $N_{\mathrm{act}}=\sum_r k_r$, the hard on-policy distillation loss is
+\begin{equation}
+  \mathcal L_{\mathrm{MTP}}
+  =-\frac{1}{N_{\mathrm{act}}}\sum_{r,j}
+    \log p^S_{r,j}(\bar y_{r,j}).
+\end{equation}
+For active index $i=(r,j)$, let $x_i=\phi_S(u^S_i)$ and
+$y_i^+=\phi_T(u^T_i)$ be features in a shared latent space, using the same
+normalization. Detached student features $y_l^-=\operatorname{sg}(x_l)$ form
+the negative population, where $\operatorname{sg}$ denotes stop-gradient.
+
+\subsection{Latent regularization}
+We compare the unified objective
+\begin{equation}
+  \mathcal L=\mathcal L_{\mathrm{MTP}}+\lambda_R\mathcal L_R,
+  \qquad R\in\{\mathrm{MSE},\mathrm{drift}\}.
+\end{equation}
+The paired regression baseline is
+\begin{equation}
+  \mathcal L_{\mathrm{MSE}}
+  =\frac{1}{N_{\mathrm{act}}}\sum_i
+    \left\|x_i-\operatorname{sg}(y_i^+)\right\|_2^2.
+\end{equation}
+For conditional drift, teacher and detached student pools $\mathcal I_i^+$ and
+$\mathcal I_i^-$ interact through
+\begin{equation}
+  \kappa_{\mathrm{cond}}(i,l;y_l)
+  =\kappa_h(x_i,y_l)\,
+    \kappa_c(g(c_i),g(c_l))\,\mathbf 1[a_i=a_l],
+\end{equation}
+where $a_i=j$ identifies the prediction horizon, $g(c_i)$ is a detached prefix
+embedding, and $\kappa_h$ and $\kappa_c$ are nonnegative distance kernels over
+features and context, respectively. For $s\in\{+,-\}$, define
+$\mathcal J_i^+=\mathcal I_i^+$ and
+$\mathcal J_i^-=\mathcal I_i^-\setminus\{i\}$. Normalize affinities as
+\begin{equation}
+  a^s_{il}
+  =\frac{\kappa_{\mathrm{cond}}(i,l;y_l^s)}
+  {\sum_{m\in\mathcal J_i^s}\kappa_{\mathrm{cond}}(i,m;y_m^s)+\epsilon},
+  \qquad l\in\mathcal J_i^s,
+\end{equation}
+with $\epsilon>0$ for numerical stability. The self-excluded drift estimate is
+\begin{equation}
+  \widehat V_i
+  =\sum_{l\in\mathcal J_i^+}a^+_{il}(y_l^+-x_i)
+   -\sum_{l\in\mathcal J_i^-}a^-_{il}(y_l^--x_i).
+\end{equation}
+Following the stopped-target construction of drifting models
+\citep{deng2026drifting}, the auxiliary objective is
+\begin{equation}
+  \mathcal L_{\mathrm{drift}}
+  =\frac{1}{N_{\mathrm{act}}}\sum_i
+  \left\|x_i-\operatorname{sg}\!\left(
+    x_i+\eta\frac{\widehat V_i}{\|\widehat V_i\|_2+\epsilon}
+  \right)\right\|_2^2,
+\end{equation}
+where $\eta$ controls the target displacement. The block-level variant applies
+the same construction to concatenated normalized block features,
+$b_r^S=k_r^{-1/2}\operatorname{vec}[x_{r,1};\ldots;x_{r,k_r}]$, and their
+teacher counterparts, grouping blocks of the same length.
+
+\subsection{Controlled comparisons}
+The planned variants are summarized in Table~\ref{tab:variants}. We will keep
+initialization, data, and training budgets comparable. During warm-up at fixed
+$k=3$, we will sweep $\lambda_R\in[10^{-4},10^{-1}]$ and target an auxiliary-to-token
+gradient-norm ratio of approximately $0.10$. We will then freeze the loss
+coefficient and evaluate static block sizes $k\in\{2,3,4,5\}$, with an extended
+sweep to $k=6,7$ if feasible. Training cost and memory will be reported alongside
+inference performance.
+
+\begin{table}[t]
+  \caption{Planned objective variants and their diagnostic roles.}
+  \label{tab:variants}
+  \centering
+  \begin{tabular}{lll}
+    \toprule
+    ID & Objective & Diagnostic role \\
+    \midrule
+    M0 & Hard on-policy MTP & Token-only baseline \\
+    M1 & M0 + paired latent MSE & Pointwise alignment \\
+    M2 & M0 + conditional full drift & Attraction and repulsion \\
+    M3 & M0 + attraction-only drift & Repulsion ablation \\
+    M4 & M0 + block-level full drift & Joint block coherence \\
+    M5 & Soft on-policy KL distillation & Soft token supervision \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Evaluation and decision rules}
+Training will use mathematical reasoning traces from GSM8K and MetaMathQA.
+The primary evaluations will cover GSM8K, AIME25, and GPQA Main; broader
+capability checks will include BBH, IFEval, and CNN/DailyMail. We will report
+task accuracy, instruction-following scores, and ROUGE-L as appropriate. The
+frozen teacher under sequential decoding ($k=1$) provides the capability-retention
+reference. All model-selection decisions will use held-out validation data.
+
+We will measure token-level expected calibration error (ECE), following the
+calibration perspective of~\citet{joshi2025calibration}. Separately, we will
+compare teacher and student feature populations using sliced Wasserstein-2,
+maximum mean discrepancy~\citep{gretton2012kernel}, Sinkhorn transport cost
+\citep{cuturi2013sinkhorn}, and 1-nearest-neighbor two-sample accuracy, with
+complementary distributional diagnostics motivated by
+\citet{esteban2026kernel}. Features will use shared normalization and any PCA
+projection fitted only on training features. Diagnostics will be reported per
+horizon; nearest-neighbor accuracy approaching $50\%$ indicates reduced
+population distinguishability under balanced sampling.
+
+We will evaluate both static and confidence-adaptive decoding. Realized token
+acceleration is
+\begin{equation}
+  k_{\mathrm{eff}}
+  =\frac{\text{emitted non-padding tokens}}
+        {\text{decoding forward passes}},
+\end{equation}
+which will be reported alongside measured throughput and end-to-end latency.
+For a single operating-point summary, validation will select the fastest
+setting within one percentage point of the sequential teacher's validation
+accuracy, when such a setting exists; it will then be frozen for test evaluation.
+We will report uncertainty over evaluation examples and, where feasible,
+training seeds. If MSE outperforms drift, or token-only training outperforms
+both regularizers, we will report that outcome and examine sampling noise,
+regularization strength, and conditioning rather than assume the proposed
+ordering holds.
 
 \section{Risks}
 \label{sec:risks}
-Identify technical and methodological risks, potential ethical concerns, and
-limitations. Describe mitigation strategies and fallback approaches.
+\paragraph{Noisy or mismatched feature populations.}
+Conditional drift depends on the size and relevance of local teacher and
+student pools. Sparse horizon groups or unrelated contexts may produce noisy
+updates. We will monitor pool sizes, kernel affinities, feature norms, and
+per-horizon diagnostics; cap or subsample pools for tractability; and retain
+paired MSE and attraction-only drift as diagnostic alternatives. Updates with
+insufficient pool support will be skipped.
+
+\paragraph{Overregularization and misleading alignment.}
+Forcing feature alignment may reduce token accuracy or encourage feature
+collapse. Matched auxiliary gradient strength and coefficient sweeps will help
+separate the effect of the regularizer from loss scaling. Lower latent distances
+or ECE alone will not be treated as evidence of improved reasoning: task scores
+and the teacher-retention gap remain necessary checks.
+
+\paragraph{Training overhead and deployment trade-offs.}
+Pairwise kernel interactions increase training compute and memory, and a larger
+configured block size need not yield proportional wall-clock speedup. We will
+bound population sizes and profile teacher passes, kernel computation, and
+training memory. Deployment comparisons will use identical hardware, batch
+sizes, prompt lengths, and generation limits.
+
+\paragraph{Generalization and evaluation validity.}
+Training on mathematical traces may degrade other capabilities, motivating the
+broader evaluation suite. Validation and test splits will remain separate, and
+training data will be checked for benchmark overlap. Faster generation may also
+amplify existing model errors; capability retention and confidence calibration
+will be assessed before making practical deployment claims.
 
 \section{Timeline \& Resources}
 \label{sec:timeline-resources}
-Outline the project phases, milestones, and deliverables. Estimate the required
-compute, data, personnel, budget, and dependencies.
+% Planning additions: the source manuscript specifies neither a calendar nor
+% a hardware allocation. Durations and budgets below remain to be confirmed.
+The work will proceed through four phases. Dates and durations remain to be
+confirmed against the available compute allocation.
+\begin{enumerate}
+  \item \textbf{Baseline reproduction:} establish the on-policy MTP pipeline,
+    sequential teacher reference, paired MSE baseline, and evaluation harness.
+  \item \textbf{Drift implementation and pilot:} implement conditional pools,
+    self-exclusion, and stopped-target updates; profile memory and runtime;
+    calibrate regularization strength at $k=3$.
+  \item \textbf{Main experiments and ablations:} run the block-size and
+    confidence-threshold sweeps, compare all objective variants, and collect
+    task, calibration, and latent-alignment measurements.
+  \item \textbf{Analysis and reporting:} quantify uncertainty, analyze failure
+    cases and capability retention, and prepare reproducible configurations
+    and the final manuscript.
+\end{enumerate}
 
-% When adding citations, create references.bib and uncomment:
-% \bibliographystyle{plainnat}
-% \bibliography{references}
+Required resources include a pretrained autoregressive checkpoint, a frozen
+teacher copy, GPUs with sufficient memory for student training and teacher
+forward passes, checkpoint storage, and held-out evaluation data. A pilot run
+will determine feasible batch and pool sizes and measure GPU-hours per run;
+the total budget will then be estimated from the planned configurations and
+seeds. The checkpoint, GPU type and count, storage budget, personnel allocation,
+and phase durations are \textbf{TBD}.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
 
 \end{document}
