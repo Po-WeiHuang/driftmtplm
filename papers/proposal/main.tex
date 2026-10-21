@@ -71,45 +71,73 @@ confidence calibration, held-out feature-distribution diagnostics, and measured
 throughput and latency. This ordering is a hypothesis to be tested rather than
 an established result.
 
-\section{novelty}
+
+\section{Novelty}
 \label{sec:novelty}
-A correct token prediction constrains relative logit margins without uniquely
-determining the hidden representation. Consequently, newly inserted MTP mask
-states must learn parallel future-token computations without explicit
-supervision over their representation geometry. Work on feature-based
-speculative decoding, including EAGLE~\citep{li2024eagle}, motivates addressing
-feature uncertainty; NextLat~\citep{teoh2025nextlatent} also provides motivation
-for auxiliary prediction in latent space.
 
-Paired SmoothL1 regression supplies dense supervision but imposes a one-to-one Euclidean match
-between each parallel student state and its sequential teacher counterpart.
-Our proposed contribution is to adapt population-level drifting
-\citep{deng2026drifting} to conditional MTP representation alignment. A local
-vector field attracts student states toward teacher feature neighborhoods and
-repels them from crowded student neighborhoods. We use a feature-distance kernel without a prefix-similarity factor;
-any horizon-specific comparisons are implemented through the selection of
-feature pools rather than through a context kernel. We will compare horizon-wise alignment with block-level alignment
-to determine whether modeling inter-token feature dependencies improves chunk
-coherence.
+This research investigates latent representation alignment in
+policy distillation, aiming to improve multi-token generation
+beyond supervision based solely on token-level predictions.
+While conventional knowledge distillation primarily constrains
+output distributions, the geometry of intermediate hidden
+representations remains underdetermined. We investigate
+whether explicitly aligning student representations with
+those of a pretrained teacher can improve the quality of
+parallel token predictions.
 
-\section{impact}
+We adopt the multi-token prediction (MTP) framework of
+\citet{kirchenbauer2026mtp}, which converts a pretrained
+autoregressive language model into a standalone multi-token
+predictor through on-policy self-distillation. The pretrained
+model serves as a frozen teacher, while a student initialized
+from the same checkpoint learns to predict multiple future
+tokens simultaneously. The teacher evaluates the student's
+proposed continuation autoregressively, providing token-level
+supervision without requiring an additional verification model
+during inference.
+
+Our methodological contribution is to introduce drifting
+regularization~\citep{deng2026drifting} into the latent
+representation space of MTP self-distillation. Inspired by
+contrastive learning, drifting constructs an attraction--repulsion
+field using hidden representations from the teacher and student.
+Teacher representations provide positive samples that attract
+student states, while other student representations form a
+negative population that produces repulsive interactions.
+Unlike pointwise feature regression, drifting aims to align
+the student and teacher feature distributions without
+requiring exact one-to-one correspondence between their
+hidden states. We investigate whether this population-level
+objective better preserves the geometric structure of the
+teacher's representations across prediction horizons.
+
+\section{Impact}
 \label{sec:impact}
-If successful, this approach could extend the usable parallel prediction horizon
-while retaining more of the sequential model's reasoning capability. The
-regularizer is applied during training and adds no inference module to the
-standalone MTP model. The intended practical benefit is improved generation
-quality at a given latency or greater throughput at a given quality target.
-These benefits require system measurements and cannot be inferred from the
-configured block size alone.
 
-We compare conventional token-level MTP distillation with two auxiliary
-objectives: SmoothL1 regression, which directly aligns paired student and
-teacher hidden states, and drifting regularization, which uses attraction
-and repulsion across feature populations. This separates pointwise matching
-from distributional alignment. Calibration and task accuracy will be
-reported independently of feature-distribution distances. A later extension could apply
-the same conditional regularizer to a speculative drafter such as
-DFlash~\citep{chen2026dflash}; the initial study will focus on standalone MTP.
+We hypothesize that improved latent representation alignment
+can enhance multi-token prediction beyond the gains achievable
+through token-level self-distillation alone. In particular,
+preserving the teacher's representation geometry may help
+the student maintain coherent and distinguishable predictive
+states across longer prediction horizons, potentially improving
+generation quality without sacrificing parallelism.
+
+The central objective is to establish whether latent geometric
+alignment contributes to measurable improvements in both
+generation accuracy and inference efficiency. If successful,
+the proposed approach could enable the model to produce
+more reliable tokens per forward pass, thereby reducing
+generation latency and increasing token throughput under
+standalone MTP inference. Since drifting regularization is
+applied only during training, it introduces no additional
+inference module or verification stage.
+
+More broadly, this study aims to clarify the relationship
+between representation geometry, token-level prediction
+quality, and the accuracy--acceleration trade-off in
+self-distilled language models. Such findings could inform
+the design of representation-level supervision for other
+parallel generation and model distillation frameworks.
 
 \section{Methods}
 \label{sec:methods}
@@ -305,13 +333,7 @@ for the remaining phases depend on compute availability.
     and the final manuscript.
 \end{enumerate}
 
-Required resources include a pretrained autoregressive checkpoint, a frozen
-teacher copy, GPUs with sufficient memory for student training and teacher
-forward passes, checkpoint storage, and held-out evaluation data. A pilot run
-will determine feasible batch and pool sizes and measure GPU-hours per run;
-the total budget will then be estimated from the planned configurations and
-seeds. The checkpoint, GPU type and count, storage budget, personnel allocation,
-and phase durations are \textbf{TBD}.
+
 
 
 \subsection{Preliminary Results and Current Progress (October 2026)}
@@ -323,9 +345,9 @@ multi-seed significance study. The experimental configurations are summarized in
 Table~\ref{tab:experiment_configurations}. We compare
 hard-teacher MTP self-distillation against drifting
 regularization, paired SmoothL1 feature regression,
-and their combination. Additional ablations investigate
+and their combination. Additional ablations such as
 kernel bandwidth selection and the maximum training
-prediction horizon $k_{\max}$.
+prediction horizon $k_{\max}$ will be investigated in 8B models.
 
 
 \begin{table}[t]
@@ -457,7 +479,7 @@ budgets and repeated seeds, quantify paired feature errors separately
 from distribution distances, and examine whether horizon-specific
 feature geometry predicts improvements in free-rollout accuracy. We
 will also study the effect of $k_{\max}$ and expand to larger checkpoints
-and broader benchmarks once the 1B methodology is consolidated.
+and broader benchmarks once the 1B and 8B methodology are consolidated.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
