@@ -51,39 +51,29 @@
 % accuracy--acceleration trade-off relative to token-only MTP and paired SmoothL1.
 % \end{abstract}
 
-\section{objective}
+
+\section{Objective}
 \label{sec:objective}
-Standard next-token prediction generates one token per step, incurring high
-memory-bandwidth overhead and inference latency during long-form generation and
-reasoning-intensive tasks. MTP mitigates this bottleneck by generating a
-contiguous block of $k$ tokens in a single forward pass. We build on on-policy
-self-distillation, in which a student proposes future tokens at inserted mask
-positions and a frozen teacher supplies supervision conditioned on the
-student-generated continuation~\citep{kirchenbauer2026mtp}.
-
-Our objective is to reduce the capability loss that accompanies longer parallel
-prediction horizons. We will test the hypothesis that, at comparable realized
-acceleration, latent regularization changes both the geometry of predictive states and
-the quality--acceleration trade-off, with potentially different outcomes
-for pointwise regression and population-level alignment. Success will be
-assessed through task scores relative to the original sequential teacher,
-confidence calibration, held-out feature-distribution diagnostics, and measured
-throughput and latency. This ordering is a hypothesis to be tested rather than
-an established result.
-
-
-\section{Novelty}
-\label{sec:novelty}
 
 This research investigates latent representation alignment in
 policy distillation, aiming to improve multi-token generation
 beyond supervision based solely on token-level predictions.
 While conventional knowledge distillation primarily constrains
 output distributions, the geometry of intermediate hidden
-representations remains underdetermined. We investigate
-whether explicitly aligning student representations with
-those of a pretrained teacher can improve the quality of
-parallel token predictions.
+representations remains underdetermined.
+
+We investigate whether aligning the student's latent
+representation geometry with that of a pretrained teacher
+can improve reasoning performance and inference efficiency.
+Specifically, we aim to determine whether better geometric
+alignment enables more accurate parallel token predictions,
+longer effective prediction horizons, and higher token
+throughput with reduced generation latency, while preserving
+the reasoning capabilities of the original autoregressive model.
+
+\section{Novelty}
+\label{sec:novelty}
+
 
 We adopt the multi-token prediction (MTP) framework of
 \citet{kirchenbauer2026mtp}, which converts a pretrained
