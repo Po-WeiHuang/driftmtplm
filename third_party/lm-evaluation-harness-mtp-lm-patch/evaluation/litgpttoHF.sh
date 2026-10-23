@@ -2,7 +2,7 @@
 set -euo pipefail
 
 #export RUN_NAME=l3_magpie_metamath
-export RUN_OUTPUT_DIR=/data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/2Llama-3.2-1B-Instruct-drift_nocolnorm_largeweight_largetemp
+export RUN_OUTPUT_DIR=/data/snoplus/weiiiiiii/aiproj/driftmtplm/outputs/NewNewLlama-3.1-8B-Magpie-drift_nocolnorm_selfpos_w0.05_tau0.02-0.1-0.2
 export CKPT_SUBDIR=latest
 
 # convert_lit_checkpoint.py resolves model_class_path/config_class_path as a

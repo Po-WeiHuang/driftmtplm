@@ -19,9 +19,10 @@ from typing import Dict
 import torch
 
 from .features import anchor_horizons, extract_predictive_states
+from .geometry import pairwise_distance_matrices
 from .metrics.calibration import expected_calibration_error
-from .metrics.latent_metrics import per_horizon_latent_metrics
-from .metrics.mmd import MMDBandwidthSchedule
+from .metrics.mmd import MMDBandwidthSchedule, paired_maximum_mean_discrepancy
+from .metrics.sinkhorn import sinkhorn_distance
 
 
 @torch.no_grad()
@@ -88,7 +89,20 @@ def compute_training_diagnostics(
             student_logits_full[:, idx, :], hard_teacher_labels_full[:, idx]
         ).item()
 
-    latent = per_horizon_latent_metrics(x, y_pos, horizons, bandwidth_schedule, step)
-    out.update({f"{prefix}/{key}": value for key, value in latent.items()})
+    # MMD: ignite's estimator with the paired (s_i, t_i) kernels added back, shared with
+    # diag/ (docs/geometry_diagnostics_report.md); plain ignite logged ~0 on most steps. The
+    # bandwidth comes from horizon 1 (always the first anchor) and is reused for every anchor.
+    d_ss, d_tt, d_st = pairwise_distance_matrices(x[:, 0], y_pos[:, 0])
+    bandwidth = bandwidth_schedule.update_from_sq_dists(
+        step, d_ss.float().square(), d_tt.float().square(), d_st.float().square()
+    )
+    del d_ss, d_tt, d_st
+    for j in horizons:
+        out[f"{prefix}/mmd/h{j}"] = paired_maximum_mean_discrepancy(
+            x[:, j - 1], y_pos[:, j - 1], bandwidth
+        ).item()
+        # Sinkhorn unchanged: raw states, cost = cdist in their own dtype.
+        out[f"{prefix}/sinkhorn/h{j}"] = sinkhorn_distance(x[:, j - 1], y_pos[:, j - 1]).item()
+    out[f"{prefix}/mmd_bandwidth"] = float(bandwidth)
 
     return out

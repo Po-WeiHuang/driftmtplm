@@ -83,11 +83,28 @@ def sinkhorn_distance(
     if p <= 0:
         raise ValueError(f"p must be > 0, got {p}")
 
-    nx, ny = x.shape[0], y.shape[0]
     cost = torch.cdist(x, y, p=float(p))  # (Nx, Ny), M_ij = ||x_i - y_j||_p
+    return sinkhorn_from_cost(cost, epsilon=epsilon, n_iters=n_iters, stop_threshold=stop_threshold)
 
-    mu = torch.full((nx,), 1.0 / nx, device=x.device, dtype=cost.dtype)
-    nu = torch.full((ny,), 1.0 / ny, device=x.device, dtype=cost.dtype)
+
+@torch.no_grad()
+def sinkhorn_from_cost(
+    cost: torch.Tensor,
+    epsilon: float = 0.1,
+    n_iters: int = 100,
+    stop_threshold: float = 1e-6,
+) -> torch.Tensor:
+    """`sinkhorn_distance` on a precomputed (Nx, Ny) ground-cost matrix.
+
+    Lets a caller that already holds the Euclidean cross-distance matrix (e.g.
+    `driftmtp.geometry`'s D_ST) reuse it instead of recomputing `torch.cdist`.
+    """
+    if cost.dim() != 2:
+        raise ValueError(f"cost must be (Nx, Ny), got {tuple(cost.shape)}")
+    nx, ny = cost.shape
+
+    mu = torch.full((nx,), 1.0 / nx, device=cost.device, dtype=cost.dtype)
+    nu = torch.full((ny,), 1.0 / ny, device=cost.device, dtype=cost.dtype)
     log_mu, log_nu = mu.log(), nu.log()
 
     u = torch.zeros_like(mu)
