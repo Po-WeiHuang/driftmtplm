@@ -10,7 +10,9 @@ and `sinkhorn` — each ECE in both a marginal and a joint (whole-block) form �
 plus the student's accuracy in each of the marginal ECE's confidence bands.
 
 Phase 2 scope: load litgpt student/teacher checkpoints, load held-out
-documents from the same `lm_eval` task free rollout evaluates on, lay them
+documents from the same `lm_eval` task free rollout evaluates on (or, with
+`documents_path`, pre-templated conversations such as training's own held-out
+val split -- see `load_parquet_documents`), lay them
 out by calling training's own `truncate_and_mask`, run both forward passes,
 and return per-region/per-horizon logits, hidden states and targets.
 
@@ -43,10 +45,24 @@ Only two things differ from `pretrain.py`, both in `build_batch_layout`:
 
 1. `offset = 0` — training rolls the offset across steps to vary where
    regions land; one deterministic pass is what a diagnostic wants.
-2. Training's `pad_token_id` / `prelude_token_ids` prediction-masking is not
-   used; short documents' out-of-range horizons are tracked in a separate
-   `valid` mask instead, which keeps the `(tot_mask_regions, k_toks)` reshape
-   fixed and gives per-horizon rather than per-region granularity.
+2. Training's `pad_token_id` prediction-masking is not used; short documents'
+   out-of-range horizons are tracked in a separate `valid` mask instead, which
+   keeps the `(tot_mask_regions, k_toks)` reshape fixed and gives per-horizon
+   rather than per-region granularity. Training's `prelude_token_ids` masking
+   (drop every region up to and including the one holding the first marker,
+   by default the Llama-3 `<|eot_id|><|start_header_id|>user<|end_header_id|>`
+   that ends the system header) is applied the same way, through `valid`, and
+   ON by default (`prelude_token_ids`, config `mask_prelude`). Unlike
+   training, a document WITHOUT the marker keeps all its regions: training's
+   `batch_find_subarray` returns -1 on a miss and `truncate_and_mask` then
+   still drops region 0.
+
+Prompts are wrapped in the checkpoint's chat template by default (config
+`chat_template`, see `load_chat_template_formatter`): the same string free
+rollout's `lm_eval --apply_chat_template` builds, so each document starts with
+the 30-token system header training sequences start with, and the reference
+answer follows the assistant header. With it on, the header-only first region of
+every document is exactly what the prelude masking drops.
 
 `truncation_length`, `mask_region_ct` and `micro_batch_size` are all config
 values matching training's `hparams.singleshot.*` / `hparams.train.*`.
@@ -58,9 +74,14 @@ mask token id and both models are positionally identical.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+
+# `<|eot_id|><|start_header_id|>user<|end_header_id|>`: the end of the fixed Llama-3 chat
+# system header. Default `prelude_token_ids` for `build_batch_layout`, matching the
+# `pqds.prelude_token_ids` of the NewNew training configs.
+LLAMA3_USER_HEADER_PRELUDE: Tuple[int, ...] = (128009, 128006, 882, 128007)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +137,48 @@ def load_litgpt_tokenizer(checkpoint_dir: Union[str, Path]):
     from litgpt.tokenizer import Tokenizer
 
     return Tokenizer(Path(checkpoint_dir))
+
+
+def load_chat_template_formatter(checkpoint_dir: Union[str, Path]) -> Callable[[str], str]:
+    """`prompt_text -> chat-formatted prompt`, built exactly like free rollout's.
+
+    Free rollout (`lm_eval --apply_chat_template`, zero-shot) sends one user turn
+    through the HF tokenizer's `apply_chat_template(..., add_generation_prompt=True)`;
+    this does the same with the checkpoint's own `chat_template.jinja`. For the Llama-3
+    template the result is `<|begin_of_text|>`, the system header ("Cutting Knowledge
+    Date ... Today Date: <today>"), the user turn holding `prompt_text`, and the
+    assistant header -- i.e. the same 30-token prefix every training sequence starts
+    with (only the date differs).
+    """
+    from transformers import AutoTokenizer
+
+    hf_tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir))
+    if not getattr(hf_tokenizer, "chat_template", None):
+        raise ValueError(f"{checkpoint_dir}: tokenizer has no chat template; set chat_template: false")
+
+    def format_prompt(prompt_text: str) -> str:
+        return hf_tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}], tokenize=False, add_generation_prompt=True
+        )
+
+    return format_prompt
+
+
+def encode_prompt(tokenizer, prompt_text: str, prompt_formatter: Optional[Callable[[str], str]] = None) -> List[int]:
+    """Prompt token ids with exactly one leading BOS.
+
+    Without a formatter: `encode(prompt_text, bos=True)` (raw text, the pre-chat-template
+    behaviour). With one: the formatted string already starts with the BOS *text*; it is
+    stripped and BOS re-added by `encode(bos=True)`, so a tokenizer whose post-processor
+    also inserts BOS cannot produce two.
+    """
+    if prompt_formatter is None:
+        return tokenizer.encode(prompt_text, bos=True).tolist()
+    text = prompt_formatter(prompt_text)
+    bos_text = "<|begin_of_text|>"
+    if text.startswith(bos_text):
+        text = text[len(bos_text):]
+    return tokenizer.encode(text, bos=True).tolist()
 
 
 def resolve_mask_token_ids(
@@ -216,6 +279,119 @@ def load_task_documents(
     return documents
 
 
+# Llama-3 chat-template markers used to split one pre-templated conversation into the
+# prompt (everything through the assistant header) and the reference answer.
+LLAMA3_BOS_TEXT = "<|begin_of_text|>"
+LLAMA3_ASSISTANT_HEADER_TEXT = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+LLAMA3_EOT_TEXT = "<|eot_id|>"
+
+
+PARQUET_TOKEN_COLUMN = "input_ids"
+PARQUET_TEXT_COLUMN = "text"
+
+
+def load_parquet_documents(
+    documents_path: Union[str, Path],
+    sample: Optional[int] = None,
+    seed: int = 0,
+    limit: Optional[int] = None,
+) -> List[Dict]:
+    """Load documents from parquet: training's own sequences, or templated conversations.
+
+    For scoring the controlled rollout on the training distribution instead of an
+    `lm_eval` test set. Two layouts are accepted, told apart by column:
+
+    * `input_ids` -- the PROCESSED split training's data pipeline wrote, e.g.
+      `<dataset>/processed/val/*.parquet`: one conversation per row, already
+      chat-templated and tokenized (BOS ... `<|eot_id|>`). These ids are used exactly
+      as stored, so the controlled rollout scores the very sequences the val loss
+      sees. Returned as `{"token_ids": [...]}`.
+    * `text` -- the RAW split, e.g. `<dataset>/val/raw/<name>/*.parquet`: the same
+      conversations as templated strings. Each is split at its LAST assistant header;
+      the prompt keeps the header but drops the leading BOS *text*, so
+      `encode_prompt(..., prompt_formatter=None)` re-adds exactly one BOS, and a
+      trailing `<|eot_id|>` is dropped from the reference, matching
+      `load_task_documents` (no EOS). Returned as `{"prompt_text", "reference_text"}`.
+
+    Either way the documents are already templated: the caller must NOT apply the
+    chat-template formatter again.
+
+    Args:
+        documents_path: a `.parquet` file, or a directory whose `*.parquet` files are
+            read in sorted order.
+        sample: draw this many documents uniformly at random (without replacement,
+            seeded by `seed`), kept in file order. `None` keeps them all. Use it
+            rather than `limit` for real runs: a grouped split may store related
+            conversations next to each other, so the first N are not a
+            representative subset.
+        seed: seed for `sample`; fix it so every checkpoint scores the same documents.
+        limit: after sampling, keep only the first N (smoke runs).
+
+    Returns:
+        A list of document dicts, all of one of the two shapes above.
+    """
+    import random
+
+    import pyarrow.parquet as pq
+
+    path = Path(documents_path)
+    files = sorted(path.glob("*.parquet")) if path.is_dir() else [path]
+    if not files or not all(f.is_file() for f in files):
+        raise ValueError(f"{documents_path}: no .parquet files found")
+
+    columns = set(pq.read_schema(files[0]).names)
+    if PARQUET_TOKEN_COLUMN in columns:
+        column = PARQUET_TOKEN_COLUMN
+    elif PARQUET_TEXT_COLUMN in columns:
+        column = PARQUET_TEXT_COLUMN
+    else:
+        raise ValueError(
+            f"{files[0]}: expected a {PARQUET_TOKEN_COLUMN!r} or {PARQUET_TEXT_COLUMN!r} column, "
+            f"got {sorted(columns)}"
+        )
+
+    texts: List = []
+    for file in files:
+        texts.extend(pq.read_table(file, columns=[column]).column(column).to_pylist())
+
+    if sample is not None:
+        if sample <= 0:
+            raise ValueError(f"sample must be positive, got {sample}")
+        if sample < len(texts):
+            keep = sorted(random.Random(seed).sample(range(len(texts)), sample))
+            texts = [texts[i] for i in keep]
+    if limit is not None:
+        texts = texts[:limit]
+
+    if column == PARQUET_TOKEN_COLUMN:
+        documents = [{"token_ids": [int(t) for t in ids]} for ids in texts if ids]
+        if not documents:
+            raise ValueError(f"{documents_path}: every {PARQUET_TOKEN_COLUMN!r} row is empty")
+        return documents
+
+    documents = []
+    n_skipped = 0
+    for text in texts:
+        text = str(text)
+        split = text.rfind(LLAMA3_ASSISTANT_HEADER_TEXT)
+        if split < 0:
+            n_skipped += 1
+            continue
+        prompt_text = text[: split + len(LLAMA3_ASSISTANT_HEADER_TEXT)]
+        if prompt_text.startswith(LLAMA3_BOS_TEXT):
+            prompt_text = prompt_text[len(LLAMA3_BOS_TEXT):]
+        reference_text = text[split + len(LLAMA3_ASSISTANT_HEADER_TEXT):]
+        if reference_text.endswith(LLAMA3_EOT_TEXT):
+            reference_text = reference_text[: -len(LLAMA3_EOT_TEXT)]
+        documents.append({"prompt_text": prompt_text, "reference_text": reference_text})
+
+    if not documents:
+        raise ValueError(f"{documents_path}: no conversation contains the Llama-3 assistant header")
+    if n_skipped:
+        print(f"load_parquet_documents: skipped {n_skipped} conversation(s) with no assistant header", flush=True)
+    return documents
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Job 3 — build training's layout, via training's own `truncate_and_mask`
@@ -247,6 +423,8 @@ class BatchLayout:
     n_mask: int                    # K
     num_toks_consumed: int         # real tokens each document contributes
     offset: int                    # region-grid offset, pretrain.py:207-233
+    prelude_token_ids: Optional[Tuple[int, ...]] = None  # None: no prelude masking
+    n_prelude_regions: int = 0     # regions marked invalid by the prelude masking
 
     @property
     def batch_size(self) -> int:
@@ -342,6 +520,7 @@ def build_batch_layout(
     mask_region_ct: int = 5,
     offset: int = 0,
     pad_id: int = 0,
+    prelude_token_ids: Optional[Sequence[int]] = LLAMA3_USER_HEADER_PRELUDE,
 ) -> BatchLayout:
     """Lay out a batch of documents by calling training's `truncate_and_mask`.
 
@@ -389,11 +568,17 @@ def build_batch_layout(
             position that is a multiple of `P` (26, 52, 78, ... at the
             shipped config). Sweep it to cover the other alignments.
         pad_id: token id used to pad short documents.
+        prelude_token_ids: marker sequence for training's prelude masking; every
+            region up to and including the one holding its first occurrence is
+            marked invalid in `valid`, exactly the regions training's
+            `truncate_and_mask(prelude_token_ids=...)` drops. Default: the Llama-3
+            user-turn header, i.e. the end of the shared system header. A
+            document without the marker keeps all its regions. `None` disables.
 
     Returns:
         A `BatchLayout`.
     """
-    from litgpt.pretrain import truncate_and_mask
+    from litgpt.pretrain import batch_find_subarray, truncate_and_mask
 
     if not documents:
         raise ValueError("documents is empty")
@@ -456,6 +641,39 @@ def build_batch_layout(
     target_real_index = source_index + 1
     real_len = torch.tensor(n_real, dtype=torch.long).unsqueeze(1)   # (B, 1)
     valid_all = target_real_index.unsqueeze(0) < real_len            # (B, S)
+
+    # Prelude masking, by training's own code path: rerun the layout with the marker
+    # and take the prediction positions it removed. The layout itself is unchanged
+    # (same tokens, same offset), so only pred_pos_mask can differ.
+    n_prelude_regions = 0
+    if prelude_token_ids:
+        prelude_token_ids = tuple(int(t) for t in prelude_token_ids)
+        _, _, _, prelude_pred_pos_mask, _ = truncate_and_mask(
+            input_ids=input_ids,
+            target_ids=target_ids,
+            k_toks=k_toks,
+            mask_id=None,
+            truncation_length=truncation_length,
+            mask_region_ct=mask_region_ct,
+            offset=offset,
+            pad_token_id=None,
+            prelude_token_ids=list(prelude_token_ids),
+            min_mask_id=mask_token_ids[0],
+            max_mask_id=span[-1] if span else mask_token_ids[0],
+            skip_max_mask_id_check=(n_mask == 0),
+        )
+        dropped = pred_pos_mask & ~prelude_pred_pos_mask
+        # On a miss truncate_and_mask still drops region 0 (find returns -1, clamped
+        # to region 0); keep those documents whole.
+        has_marker = batch_find_subarray(
+            prepared_target_ids, torch.tensor(prelude_token_ids, dtype=prepared_target_ids.dtype)
+        ) >= 0
+        dropped &= has_marker.unsqueeze(1)
+        valid_all = valid_all & ~dropped
+        n_prelude_regions = int(dropped[pred_pos_mask].view(-1, k_toks).any(dim=1).sum())
+    else:
+        prelude_token_ids = None
+
     valid = valid_all[pred_pos_mask].view(len(documents) * mask_region_ct, k_toks)
 
     return BatchLayout(
@@ -475,6 +693,8 @@ def build_batch_layout(
         n_mask=n_mask,
         num_toks_consumed=num_toks_consumed,
         offset=offset,
+        prelude_token_ids=prelude_token_ids,
+        n_prelude_regions=n_prelude_regions,
     )
 
 
@@ -740,12 +960,18 @@ def process_batch(
     offset: int = 0,
     pad_id: int = 0,
     device=None,
+    prelude_token_ids: Optional[Sequence[int]] = LLAMA3_USER_HEADER_PRELUDE,
+    prompt_formatter: Optional[Callable[[str], str]] = None,
 ):
     """One batch of documents, start to finish: tokenize -> lay out -> both passes.
 
     Each document's prompt and reference answer are tokenized into one
     continuous real sequence (BOS on the prompt only, no EOS), then truncated
-    to `num_toks_consumed` tokens. Regions tile across all of it, question
+    to `num_toks_consumed` tokens. With `prompt_formatter` (see
+    `load_chat_template_formatter`; ON by default through the config's
+    `chat_template`) the prompt is first wrapped in the chat template, so the
+    sequence is laid out like training's and free rollout's: system header,
+    user turn, assistant header, then the reference answer. Regions tile across all of it, question
     included — this harness does not score answers, and the block mask means
     mask slots inside the question cannot affect anything, so there is
     nothing to exclude.
@@ -755,7 +981,11 @@ def process_batch(
     """
     token_ids = []
     for doc in documents:
-        prompt_ids = tokenizer.encode(doc["prompt_text"], bos=True).tolist()
+        if "token_ids" in doc:
+            # Already-tokenized training sequence (load_parquet_documents): used as is.
+            token_ids.append(list(doc["token_ids"]))
+            continue
+        prompt_ids = encode_prompt(tokenizer, doc["prompt_text"], prompt_formatter)
         reference_ids = tokenizer.encode(doc["reference_text"], bos=False, eos=False).tolist()
         token_ids.append(prompt_ids + reference_ids)
 
@@ -767,6 +997,7 @@ def process_batch(
         mask_region_ct=mask_region_ct,
         offset=offset,
         pad_id=pad_id,
+        prelude_token_ids=prelude_token_ids,
     )
     outputs = run_controlled_forward(student, teacher, layout, device=device)
     return layout, outputs
@@ -998,6 +1229,7 @@ def per_horizon_records(
     min_ece_samples: int = 300,
     min_latent_samples: int = 200,
     thin_bin_below: int = 30,
+    mmd_bandwidth: Optional[float] = None,
 ):
     """One record per horizon, plus the MMD bandwidth they all share.
 
@@ -1019,6 +1251,12 @@ def per_horizon_records(
     a moving kernel. Horizon 1 is the one horizon `conf_adapt` never filters
     (`modeling_llama.py:906-907`), so the bandwidth always comes from the
     full population. This mirrors `mmd.py`'s training-time policy.
+
+    `mmd_bandwidth` (squared-distance units, ignite's `var`) replaces that
+    median heuristic with a fixed value. The heuristic is re-derived from each
+    checkpoint's own horizon-1 features, so two checkpoints get different
+    kernels (14.7k-19.7k across the NewNewLlama 1B runs) and their MMDs are not
+    on one scale; a fixed bandwidth makes MMD comparable across checkpoints.
 
     Horizons with no selected samples are **omitted**, never emitted as `0.0`
     or `NaN`.
@@ -1070,11 +1308,14 @@ def per_horizon_records(
     k_toks = pooled["confidence"].shape[1]
     generator = torch.Generator().manual_seed(seed)
 
-    schedule = MMDBandwidthSchedule(warmup_steps=1)
     bandwidth = None
     x1, y1 = horizon_features(pooled, 1, max_pool_samples, generator)
-    if x1.shape[0] > 0:
-        bandwidth = schedule.update(0, x1, y1)
+    if mmd_bandwidth is not None:
+        if not mmd_bandwidth > 0:
+            raise ValueError(f"mmd_bandwidth must be positive, got {mmd_bandwidth}")
+        bandwidth = torch.tensor(float(mmd_bandwidth))
+    elif x1.shape[0] > 0:
+        bandwidth = MMDBandwidthSchedule(warmup_steps=1).update(0, x1, y1)
 
     records = []
     for j in range(1, k_toks + 1):
@@ -1352,6 +1593,9 @@ def build_results_payload(
     teacher_checkpoint: str,
     confband: Optional[Dict[str, Dict]] = None,
     min_band_samples: Optional[int] = None,
+    prelude_token_ids: Optional[Sequence[int]] = None,
+    n_prelude_regions: int = 0,
+    chat_template: bool = False,
 ) -> Dict:
     """Assemble the JSON payload, and refuse to build a non-finite one.
 
@@ -1387,6 +1631,12 @@ def build_results_payload(
         "aggregate": aggregate,
         "confband": {} if confband is None else confband,
         "min_band_samples": min_band_samples,
+        # Prelude masking actually applied (None = off) and how many regions it removed
+        # in total; 0 with a marker set means no document contained it.
+        "prelude_token_ids": None if not prelude_token_ids else [int(t) for t in prelude_token_ids],
+        "n_prelude_regions": n_prelude_regions,
+        # Whether prompts were wrapped in the checkpoint's chat template (as free rollout's).
+        "chat_template": bool(chat_template),
     }
     _assert_finite(payload)
     return payload
@@ -1477,6 +1727,9 @@ def run_controlled_rollout(
     student_checkpoint: str = "",
     teacher_checkpoint: str = "",
     progress: bool = False,
+    prelude_token_ids: Optional[Sequence[int]] = LLAMA3_USER_HEADER_PRELUDE,
+    prompt_formatter: Optional[Callable[[str], str]] = None,
+    mmd_bandwidth: Optional[float] = None,
 ) -> Dict:
     """The whole diagnostic: documents in, results payload out.
 
@@ -1497,9 +1750,10 @@ def run_controlled_rollout(
     """
     _, threshold = parse_strategy(strategy)
     accumulator = HorizonAccumulator(k_toks)
+    n_prelude_regions = 0
 
     for batch_index, batch in enumerate(batch_documents(documents, micro_batch_size)):
-        _, outputs = process_batch(
+        layout, outputs = process_batch(
             student,
             teacher,
             tokenizer,
@@ -1511,7 +1765,10 @@ def run_controlled_rollout(
             offset=offset,
             pad_id=pad_id,
             device=device,
+            prelude_token_ids=prelude_token_ids,
+            prompt_formatter=prompt_formatter,
         )
+        n_prelude_regions += layout.n_prelude_regions
         accumulator.add(outputs, selected_mask(outputs, threshold), n_documents=len(batch))
         # Logits die with `outputs` at the end of this iteration; only the
         # reductions and the hidden states survive into the accumulator.
@@ -1527,6 +1784,7 @@ def run_controlled_rollout(
         seed=seed,
         min_ece_samples=min_ece_samples,
         min_latent_samples=min_latent_samples,
+        mmd_bandwidth=mmd_bandwidth,
     )
     aggregate = aggregate_horizons(records, pooled)
     if min_band_samples is None:
@@ -1550,6 +1808,9 @@ def run_controlled_rollout(
         teacher_checkpoint=teacher_checkpoint,
         confband=confband,
         min_band_samples=min_band_samples,
+        prelude_token_ids=prelude_token_ids,
+        n_prelude_regions=n_prelude_regions,
+        chat_template=prompt_formatter is not None,
     )
 
 
@@ -1598,7 +1859,35 @@ _CONFIG_DEFAULTS: Dict[str, object] = {
     "precision": None,
     "reference_field": "answer",
     "mask_token_pattern": "<|mtp_special_token_{i}|>",
+    # Training's prelude masking (see build_batch_layout). ON by default; set
+    # mask_prelude: false (CLI --no-mask-prelude) to score every region.
+    "mask_prelude": True,
+    # Wrap each prompt in the checkpoint's chat template, exactly like free rollout's
+    # `--apply_chat_template` (see load_chat_template_formatter). ON by default; set
+    # chat_template: false (CLI --no-chat-template) for the raw doc_to_text prompt.
+    "chat_template": True,
+    "prelude_token_ids": "-".join(str(t) for t in LLAMA3_USER_HEADER_PRELUDE),
+    # Score pre-templated conversations from parquet (see load_parquet_documents)
+    # instead of the lm_eval task's documents; `task` then only labels the output.
+    # `chat_template` is ignored for them: they are already templated.
+    "documents_path": None,
+    "documents_sample": None,
+    "documents_seed": 0,
+    # Fixed MMD kernel bandwidth (squared-distance units). None -> median heuristic
+    # on each checkpoint's own horizon-1 features, which differs per checkpoint.
+    "mmd_bandwidth": None,
 }
+
+
+def parse_prelude_token_ids(value) -> Optional[Tuple[int, ...]]:
+    """'128009-128006-882-128007' (training's pqds format), a list, or None -> tuple / None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return tuple(int(t) for t in value.split("-"))
+    if isinstance(value, int):
+        return (value,)
+    return tuple(int(t) for t in value)
 
 
 def load_yaml_config(config_path: Union[str, Path]) -> Dict:
@@ -1668,6 +1957,21 @@ def resolve_config(yaml_block: Optional[Dict] = None, cli_overrides: Optional[Di
         )
 
     config["k_toks"] = int(config["k_toks"])
+    if config["documents_path"] in ("", "none", "None"):
+        config["documents_path"] = None
+    if config["documents_sample"] is not None:
+        config["documents_sample"] = int(config["documents_sample"])
+        if config["documents_sample"] <= 0:
+            raise ValueError(f"documents_sample must be positive, got {config['documents_sample']}")
+    if config["mmd_bandwidth"] in ("", "none", "None"):
+        config["mmd_bandwidth"] = None
+    if config["mmd_bandwidth"] is not None:
+        config["mmd_bandwidth"] = float(config["mmd_bandwidth"])
+        if not config["mmd_bandwidth"] > 0:
+            raise ValueError(f"mmd_bandwidth must be positive, got {config['mmd_bandwidth']}")
+    config["prelude_token_ids"] = (
+        parse_prelude_token_ids(config["prelude_token_ids"]) if config["mask_prelude"] else None
+    )
     parse_strategy(config["strategy"])  # raise now, not after both models are loaded
     layout_geometry(config["k_toks"], config["truncation_length"], config["mask_region_ct"])
     return config
@@ -1701,7 +2005,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="litgpt checkpoint dir (lit_model.pth + model_config.yaml) -- NOT the HF dir")
     parser.add_argument("--teacher-checkpoint", "--teacher_checkpoint", dest="teacher_checkpoint",
                         help="frozen teacher, same format as --student-checkpoint")
-    parser.add_argument("--task", help=f"lm_eval task name; must be in {sorted(_SUPPORTED_TASKS)}")
+    parser.add_argument("--task", help=f"lm_eval task free rollout ran; labels the output and, without "
+                                       f"--documents-path, supplies the documents (must be in "
+                                       f"{sorted(_SUPPORTED_TASKS)})")
+    parser.add_argument("--documents-path", "--documents_path", dest="documents_path",
+                        help="score this .parquet file or directory instead of --task's documents: "
+                             "training's processed split ('input_ids' column, used as is) or a raw "
+                             "templated split ('text' column); 'none' forces --task's documents, "
+                             "overriding a documents_path set in the YAML")
+    parser.add_argument("--documents-sample", "--documents_sample", dest="documents_sample", type=int,
+                        help="with --documents-path: score a seeded random subset of this many conversations")
+    parser.add_argument("--documents-seed", "--documents_seed", dest="documents_seed", type=int,
+                        help="seed for --documents-sample (default 0); keep it fixed across checkpoints")
+    parser.add_argument("--mmd-bandwidth", "--mmd_bandwidth", dest="mmd_bandwidth",
+                        help="fixed MMD kernel bandwidth, squared-distance units (e.g. 16000); "
+                             "'none' = median heuristic per checkpoint")
     parser.add_argument("--out-dir", "--out_dir", dest="out_dir",
                         help="the SAME directory lm_eval wrote results_*.json into")
     parser.add_argument("--k-toks", "--k_toks", dest="k_toks", type=int,
@@ -1726,6 +2044,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--limit", type=int, help="evaluate only the first N documents (debugging)")
     parser.add_argument("--precision", help="Fabric precision string, e.g. bf16-true")
     parser.add_argument("--reference-field", "--reference_field", dest="reference_field")
+    prelude = parser.add_mutually_exclusive_group()
+    prelude.add_argument("--mask-prelude", "--mask_prelude", dest="mask_prelude", action="store_true",
+                         default=None, help="drop the system-header regions, as training does (default)")
+    prelude.add_argument("--no-mask-prelude", "--no_mask_prelude", dest="mask_prelude", action="store_false",
+                         help="score every region, header included")
+    chat = parser.add_mutually_exclusive_group()
+    chat.add_argument("--chat-template", "--chat_template", dest="chat_template", action="store_true",
+                      default=None, help="wrap prompts in the checkpoint's chat template (default)")
+    chat.add_argument("--no-chat-template", "--no_chat_template", dest="chat_template", action="store_false",
+                      help="use the raw doc_to_text prompt")
+    parser.add_argument("--prelude-token-ids", "--prelude_token_ids", dest="prelude_token_ids",
+                        help="marker token ids, '-'-separated (default: Llama-3 user header)")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run", action="store_true",
                         help="resolve and print the config, then exit without loading any model")
     args = parser.parse_args(argv)
@@ -1747,18 +2077,47 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"controlled rollout: task={config['task']} k_toks={config['k_toks']} "
           f"strategy={config['strategy']!r}", flush=True)
 
+    # Load the documents before either model: a bad path should fail in seconds.
+    if config["documents_path"] is not None:
+        documents = load_parquet_documents(
+            config["documents_path"],
+            sample=config["documents_sample"],
+            seed=config["documents_seed"],
+            limit=config["limit"],
+        )
+        document_source = {
+            "type": "parquet",
+            "path": str(config["documents_path"]),
+            "format": "token_ids" if "token_ids" in documents[0] else "text",
+            "sample": config["documents_sample"],
+            "sample_seed": config["documents_seed"],
+            "pretemplated": True,
+        }
+    else:
+        documents = load_task_documents(
+            config["task"], reference_field=config["reference_field"], limit=config["limit"]
+        )
+        document_source = {
+            "type": "lm_eval_task",
+            "task": config["task"],
+            "reference_field": config["reference_field"],
+        }
+    print(f"loaded {len(documents)} documents from {document_source}", flush=True)
+
     student = load_litgpt_model(config["student_checkpoint"], precision=config["precision"])
     teacher = load_litgpt_model(config["teacher_checkpoint"], precision=config["precision"])
     tokenizer = load_litgpt_tokenizer(config["student_checkpoint"])
+    # Parquet conversations are already templated; wrapping them again would nest templates.
+    prompt_formatter = (
+        load_chat_template_formatter(config["student_checkpoint"])
+        if config["chat_template"] and config["documents_path"] is None
+        else None
+    )
     mask_token_ids = resolve_mask_token_ids(
         tokenizer,
         pattern=config["mask_token_pattern"],
         num_tokens=max(config["k_toks"] - 1, 1),
     )
-    documents = load_task_documents(
-        config["task"], reference_field=config["reference_field"], limit=config["limit"]
-    )
-    print(f"loaded {len(documents)} documents", flush=True)
 
     payload = run_controlled_rollout(
         student,
@@ -1783,9 +2142,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         student_checkpoint=config["student_checkpoint"],
         teacher_checkpoint=config["teacher_checkpoint"],
         progress=True,
+        prelude_token_ids=config["prelude_token_ids"],
+        prompt_formatter=prompt_formatter,
+        mmd_bandwidth=config["mmd_bandwidth"],
     )
+    payload["document_source"] = document_source
+    payload["mmd_bandwidth_source"] = "fixed" if config["mmd_bandwidth"] is not None else "median_heuristic_h1"
     path = write_results(payload, config["out_dir"])
     print(f"wrote {path}")
+    print(f"  chat template: {payload['chat_template']}, prelude masking: {payload['prelude_token_ids']} "
+          f"({payload['n_prelude_regions']} regions dropped)")
     for record in payload["per_horizon"]:
         print(f"  h{record['horizon']}: n={record['n_samples']} "
               f"ece_gt={record.get('ece_stud_gt', float('nan')):.4f} "

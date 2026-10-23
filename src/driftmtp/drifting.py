@@ -140,6 +140,32 @@ class TemperatureFieldDiagnostics:
     # self-anchor-starvation signature flagged in claudedriftingplan.md's "Column-Normalization
     # Toggle" section -- the drift signal is being silenced by the mass-split prefactor, not by
     # genuine convergence of the teacher/student populations.
+    # Effective neighbour count of each population's affinity row, renormalized to a
+    # distribution p (claudedriftingplan.md > Kernel Temperature > Effective neighbour
+    # count): N_eff = 1 / sum_l p_rl^2, averaged over queries. ~1 means hard nearest
+    # neighbour (tau too small), ~R means uniform weights (tau too large).
+    n_eff_pos: float = 0.0
+    n_eff_neg: float = 0.0
+    # mean_r p_pos[r, r]: positive mass on the query's own paired teacher. Identically 0.0
+    # when exclude_self_positive=True; near 1 means the positive half of the field has
+    # collapsed to per-token regression y_pos[r] - x[r].
+    self_pos_weight: float = 0.0
+
+
+def _affinity_row_stats(a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(mean_r N_eff, mean_r p[r, r]) of an (R, R) affinity, each row renormalized to sum
+    to 1. `drifting_weights` only rescales whole rows, so this is the same before and
+    after the Algorithm-2 reweighting.
+
+    Under use_column_norm=True a row's geometric-mean affinity can underflow to all zeros
+    at very small tau. Such a row has no distribution (and contributes nothing to the
+    field), so it is left out of both means; NaN if every row is."""
+    a = a.detach().float()
+    row_mass = a.sum(dim=1)
+    live = row_mass > 0
+    p = a[live] / row_mass[live, None]
+    n_eff = 1.0 / p.pow(2).sum(dim=1)
+    return n_eff.mean(), p.gather(1, live.nonzero()).mean()
 
 
 @dataclass
@@ -229,6 +255,8 @@ def token_drift_field(
             w_pos, w_neg = a_pos, a_neg
         v_tau = raw_drift_field(w_pos, w_neg, y_pos_n, y_neg_n)
         v_tau_tilde, lambda_tau = rms_field_normalize(v_tau, eps=eps)
+        n_eff_pos, self_pos_weight = _affinity_row_stats(a_pos)
+        n_eff_neg, _ = _affinity_row_stats(a_neg)
 
         per_temp_fields.append(v_tau_tilde)
         diagnostics.append(
@@ -239,6 +267,9 @@ def token_drift_field(
                 normalized_field_rms=_field_rms(v_tau_tilde),
                 mass_pos=mass_pos.mean().item(),
                 mass_neg=mass_neg.mean().item(),
+                n_eff_pos=n_eff_pos.item(),
+                n_eff_neg=n_eff_neg.item(),
+                self_pos_weight=self_pos_weight.item(),
             )
         )
 

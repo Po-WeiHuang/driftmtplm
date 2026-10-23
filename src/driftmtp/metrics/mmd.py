@@ -28,9 +28,16 @@ is instead:
 `MMDBandwidthSchedule` implements this policy; `maximum_mean_discrepancy` itself just takes
 whatever fixed bandwidth it's given, with no default, so the policy can't be silently
 bypassed by an accidental per-call recompute.
+
+TRAINING DIAGNOSTICS NO LONGER USE ignite (docs/geometry_diagnostics_report.md). Student and
+teacher states are PAIRED (s_i, t_i are the same token), and ignite keeps the n paired terms
+k(s_i, t_i) in its cross term, which biases MMD^2 downward; its sqrt(clamp(.)) then logs most
+steps as exactly 0. `paired_maximum_mean_discrepancy` is the replacement: ignite's estimator
+with those paired terms added back (Gretton et al. 2012, Lemma 6), in float32.
+`maximum_mean_discrepancy` remains only for the eval pipeline (condrollouteval). `MMDBandwidthSchedule` is checkpointable (`state_dict`/`load_state_dict`).
 """
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from ignite.metrics import MaximumMeanDiscrepancy as _IgniteMMD
@@ -59,6 +66,25 @@ def median_heuristic_bandwidth(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor
     n = d2.shape[0]
     off_diag = d2[~torch.eye(n, dtype=torch.bool, device=d2.device)]
     return off_diag.median().clamp_min(1e-12)
+
+
+@torch.no_grad()
+def median_heuristic_bandwidth_from_sq_dists(
+    d2_xx: torch.Tensor, d2_yy: torch.Tensor, d2_xy: torch.Tensor
+) -> torch.Tensor:
+    """`median_heuristic_bandwidth` from precomputed squared-distance blocks.
+
+    The off-diagonal entries of the pooled {x, y} matrix are exactly the
+    off-diagonal entries of XX and YY plus every XY entry twice (XY and its
+    transpose YX), so this returns the same median without rebuilding the
+    pooled (2N, 2N) matrix.
+    """
+    n_x, n_y = d2_xx.shape[0], d2_yy.shape[0]
+    off_x = ~torch.eye(n_x, dtype=torch.bool, device=d2_xx.device)
+    off_y = ~torch.eye(n_y, dtype=torch.bool, device=d2_yy.device)
+    xy = d2_xy.reshape(-1)
+    pooled = torch.cat([d2_xx[off_x], d2_yy[off_y], xy, xy])
+    return pooled.median().clamp_min(1e-12)
 
 
 class MMDBandwidthSchedule:
@@ -93,6 +119,21 @@ class MMDBandwidthSchedule:
             self._value = median_heuristic_bandwidth(x_h1, y_h1)
         return self._value
 
+    def state_dict(self) -> Dict:
+        value = None if self._value is None else self._value.detach().float().cpu()
+        return {"warmup_steps": self.warmup_steps, "value": value}
+
+    def load_state_dict(self, state: Dict) -> None:
+        self._value = state["value"]
+
+    def update_from_sq_dists(
+        self, step: int, d2_xx: torch.Tensor, d2_yy: torch.Tensor, d2_xy: torch.Tensor
+    ) -> torch.Tensor:
+        """`update`, for a caller that already holds horizon-1's squared-distance blocks."""
+        if self._value is None or step < self.warmup_steps:
+            self._value = median_heuristic_bandwidth_from_sq_dists(d2_xx, d2_yy, d2_xy)
+        return self._value
+
     @property
     def is_frozen(self) -> bool:
         return self._value is not None
@@ -104,6 +145,44 @@ class MMDBandwidthSchedule:
                 "MMDBandwidthSchedule.update() must be called at least once before .value is read."
             )
         return self._value
+
+
+@torch.no_grad()
+def paired_maximum_mean_discrepancy(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    bandwidth: torch.Tensor,
+) -> torch.Tensor:
+    """ignite's MMD with the paired cross terms k(x_i, y_i) added back.
+
+    x_i and y_i are PAIRED (student and teacher state of the same token). ignite's cross
+    term XY = mean over ALL n^2 pairs includes the n paired kernels, which are large because
+    paired states are close, and MMD^2 = XX + YY - 2 XY subtracts them. That biases MMD^2
+    downward, so after ignite's clamp most steps log exactly 0. Here XY averages only the
+    i != j pairs (normalised by n(n-1)), which adds the paired kernels back; XX and YY are
+    ignite's own (self pairs excluded). This is Gretton et al. 2012, Lemma 6.
+
+    Runs ignite's `update` on float32 copies (bf16 sums quantise the result) and reads its
+    accumulators instead of calling `compute()`, which would also all-reduce across ranks.
+
+    Returns sqrt(clamp(MMD^2, 0)), the same quantity ignite reports.
+    """
+    if x.dim() != 2 or x.shape != y.shape:
+        raise ValueError(f"x, y must be matching (N, d); got {tuple(x.shape)}, {tuple(y.shape)}")
+    n = x.shape[0]
+    if n < 2:
+        raise ValueError("need at least 2 paired samples")
+    x32, y32 = x.float(), y.float()
+    var = float(bandwidth)
+
+    metric = _IgniteMMD(var=var, device=x.device)
+    metric.update((x32, y32))
+    # ignite 0.5.5 accumulators after one update: XX, YY (diagonal excluded) and XY (all n^2).
+    xx, yy, xy_all = metric._xx_sum, metric._yy_sum, metric._xy_sum
+
+    k_pair = torch.exp(-0.5 * (x32 - y32).square().sum(dim=-1) / var).sum()
+    xy = (xy_all * (n * n) - k_pair) / (n * (n - 1))
+    return (xx + yy - 2.0 * xy).clamp_min(0.0).sqrt()
 
 
 @torch.no_grad()

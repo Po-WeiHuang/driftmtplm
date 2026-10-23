@@ -55,3 +55,19 @@ metadata:
     # 15 ECE bands (1/15 = 0.067). null -> derive from n_bins (217 at 15 bins).
     # See docs/eval_pipeline/confband_accuracy.md.
     min_band_samples: 220
+    # Documents the controlled rollout scores: training's own held-out val split
+    # (processed, `input_ids` column, used exactly as training tokenized it) rather
+    # than the free-rollout task's test set, so calibration is measured on the
+    # training distribution. A raw split with a templated `text` column also works.
+    # null -> the lm_eval task's own documents. CLI --documents-path overrides this;
+    # --documents-path none forces the task's documents.
+    documents_path: /data/snoplus/weiiiiiii/aiproj/driftmtplm/dataset/train/outputs/Llama-3.2-1B-Instruct-MTPV128384/processed/val
+    # Seeded random subset of the 31,548 val sequences; keep the seed fixed so every
+    # checkpoint scores the same sequences. null -> all of them.
+    documents_sample: 4000
+    documents_seed: 0
+    # Fixed MMD kernel bandwidth (squared-distance units, ignite's `var`), so MMD is
+    # on one scale across checkpoints. null -> median heuristic on each checkpoint's
+    # own horizon-1 features (14.7k-19.7k across the NewNewLlama 1B runs). Sinkhorn
+    # has no bandwidth: raw Euclidean cost, entropic epsilon 0.1.
+    mmd_bandwidth: 16000

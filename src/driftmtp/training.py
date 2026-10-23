@@ -158,6 +158,14 @@ class DriftAccumulationTracker:
         # use_column_norm=False, in which case they are a config self-check.
         self._anchor_mass_pos: Dict[int, Dict[float, deque]] = {}
         self._anchor_mass_neg: Dict[int, Dict[float, deque]] = {}
+        # Kernel-width diagnostics (claudedriftingplan.md > Kernel Temperature >
+        # Effective neighbour count): N_eff ~1 means a temperature acts as a hard
+        # nearest-neighbour selector, ~R means uniform weights. self_pos_weight is the
+        # positive mass on the query's own paired teacher, identically 0.0 when
+        # exclude_self_positive=True.
+        self._anchor_n_eff_pos: Dict[int, Dict[float, deque]] = {}
+        self._anchor_n_eff_neg: Dict[int, Dict[float, deque]] = {}
+        self._anchor_self_pos_weight: Dict[int, Dict[float, deque]] = {}
 
     def update(self, per_horizon_results: List[DriftFieldResult], k_toks: int) -> None:
         """Record one micro-substep's per-horizon results, broken out per
@@ -204,6 +212,15 @@ class DriftAccumulationTracker:
                 self._anchor_mass_neg.setdefault(j, {}).setdefault(
                     tau, deque(maxlen=self.window)
                 ).append(diag.mass_neg)
+                self._anchor_n_eff_pos.setdefault(j, {}).setdefault(
+                    tau, deque(maxlen=self.window)
+                ).append(diag.n_eff_pos)
+                self._anchor_n_eff_neg.setdefault(j, {}).setdefault(
+                    tau, deque(maxlen=self.window)
+                ).append(diag.n_eff_neg)
+                self._anchor_self_pos_weight.setdefault(j, {}).setdefault(
+                    tau, deque(maxlen=self.window)
+                ).append(diag.self_pos_weight)
 
     def _prune_stale_anchor_horizons(self, current_anchors: List[int]) -> None:
         """Drop any previously-tracked anchor horizon that is NOT part of this
@@ -221,6 +238,9 @@ class DriftAccumulationTracker:
             self._anchor_normalized_field_rms.pop(j, None)
             self._anchor_mass_pos.pop(j, None)
             self._anchor_mass_neg.pop(j, None)
+            self._anchor_n_eff_pos.pop(j, None)
+            self._anchor_n_eff_neg.pop(j, None)
+            self._anchor_self_pos_weight.pop(j, None)
 
     def compute(self, prefix: str = "drift") -> Dict[str, float]:
         """Mean/std/ratio over whatever is currently in the window (up to the
@@ -281,14 +301,27 @@ class DriftAccumulationTracker:
             for tau in self.temperatures:
                 if tau in self._anchor_mass_neg[j]:
                     emit(f"mass_neg_tau_{tau}_h{j}", self._anchor_mass_neg[j][tau])
+        for j in sorted(self._anchor_n_eff_pos):
+            for tau in self.temperatures:
+                if tau in self._anchor_n_eff_pos[j]:
+                    emit(f"n_eff_pos_tau_{tau}_h{j}", self._anchor_n_eff_pos[j][tau])
+        for j in sorted(self._anchor_n_eff_neg):
+            for tau in self.temperatures:
+                if tau in self._anchor_n_eff_neg[j]:
+                    emit(f"n_eff_neg_tau_{tau}_h{j}", self._anchor_n_eff_neg[j][tau])
+        for j in sorted(self._anchor_self_pos_weight):
+            for tau in self.temperatures:
+                if tau in self._anchor_self_pos_weight[j]:
+                    emit(f"self_pos_weight_tau_{tau}_h{j}", self._anchor_self_pos_weight[j][tau])
         return out
 
 
 # ---------------------------------------------------------------------------
 # Smooth-L1 feature regulariser (EAGLE-style), see claudesmoothL1plan.md.
-# Mutually exclusive with the drift loss above: both regularise the same
-# predictive states, but Smooth-L1 is paired (student r,j -> teacher r,j) with
-# a per-horizon adaptive beta_j instead of an unpaired kernel field.
+# Can be combined with the drift loss above (their weighted terms are summed):
+# both regularise the same predictive states, but Smooth-L1 is paired
+# (student r,j -> teacher r,j) with a per-horizon adaptive beta_j instead of an
+# unpaired kernel field.
 # ---------------------------------------------------------------------------
 
 # Floor on beta_j. A zero beta (student == teacher exactly) would put a 0/0 in
