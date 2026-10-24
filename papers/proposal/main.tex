@@ -62,14 +62,21 @@ While conventional knowledge distillation primarily constrains
 output distributions, the geometry of intermediate hidden
 representations remains underdetermined.
 
-We investigate whether aligning the student's latent
-representation geometry with that of a pretrained teacher
-can improve reasoning performance and inference efficiency.
-Specifically, we aim to determine whether better geometric
-alignment enables more accurate parallel token predictions,
-longer effective prediction horizons, and higher token
-throughput with reduced generation latency, while preserving
-the reasoning capabilities of the original autoregressive model.
+We aim to develop a geometry-aware drifting regularizer
+for aligning student and teacher hidden-state distributions,
+and systematically compare its effects with paired feature
+regression. We investigate how these distinct alignment
+objectives influence multi-token rollout performance,
+including reasoning accuracy, effective prediction horizon,
+generation latency, and token throughput. In particular,
+we seek to identify the conditions under which
+population-level drifting or pointwise regression is more
+beneficial, and characterize their limitations across
+prediction horizons, regularization strengths, and model
+scales. The resulting analysis aims to establish practical
+guidelines for selecting latent-space supervision strategies
+that balance representation alignment, generation quality,
+and inference efficiency.
 
 \section{Novelty}
 \label{sec:novelty}
@@ -302,7 +309,7 @@ training data will be checked for benchmark overlap. Faster generation may also
 amplify existing model errors; capability retention and confidence calibration
 will be assessed before making practical deployment claims.
 
-\section{Timeline \& Resources}
+\section{Timeline \& Preliminary Results }
 \label{sec:timeline-resources}
 % Planning additions: the source manuscript specifies neither a calendar nor
 % a hardware allocation. Durations and budgets below remain to be confirmed.
@@ -326,7 +333,7 @@ for the remaining phases depend on compute availability.
 
 
 
-\subsection{Preliminary Results and Current Progress (October 2026)}
+\subsection{Current Progress (October 2026)}
 The on-policy MTP baseline has been reproduced, and pilot comparisons of
 unregularized MTP, SmoothL1, drifting, and combined objectives have been
 performed at the 1B scale. The following observations are preliminary;
