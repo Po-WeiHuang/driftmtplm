@@ -11,7 +11,7 @@ not computed here.
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -74,7 +74,7 @@ def effective_temperature(tau: float, d_h: int) -> float:
 
 
 def rms_field_normalize(
-    V: torch.Tensor, eps: float = 1e-6
+    V: torch.Tensor, eps: float = 1e-6, scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-coordinate RMS field normalization (claudedriftingplan.md,
     "Multi-Temperature Field Normalization"):
@@ -87,9 +87,21 @@ def rms_field_normalize(
     implementation's own choice, small enough to be a no-op whenever
     `lambda_{tau,j}` is not degenerately close to zero.
 
-    Returns (V_tilde, lambda_{tau,j}); lambda_{tau,j} is detached.
+    `scale` (optional, detached scalar tensor) replaces the live lambda_{tau,j}
+    as the divisor: V_tilde = V / (scale + eps). A NaN `scale` means "use the
+    live value", so a caller can pass a per-temperature tensor with only some
+    entries frozen (claudetiedselfnegplan.md > Why the Field Scale Must Be
+    Frozen). `scale=None` is today's behaviour exactly.
+
+    Returns (V_tilde, lambda_{tau,j}); lambda_{tau,j} is the LIVE batch RMS
+    whatever `scale` is, and is detached.
     """
     d_h = V.shape[-1]
     lam = torch.sqrt((V.pow(2).sum(dim=-1) / d_h).mean()).detach()
-    V_tilde = V / (lam + eps)
+    if scale is None:
+        divisor = lam
+    else:
+        scale = scale.detach().to(lam.dtype)
+        divisor = torch.where(torch.isnan(scale), lam, scale)
+    V_tilde = V / (divisor + eps)
     return V_tilde, lam
