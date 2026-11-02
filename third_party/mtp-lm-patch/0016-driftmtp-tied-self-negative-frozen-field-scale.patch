@@ -1,0 +1,136 @@
+diff --git a/litgpt/args.py b/litgpt/args.py
+index 056c7f1..3fd3376 100644
+--- a/litgpt/args.py
++++ b/litgpt/args.py
+@@ -412,8 +412,26 @@ class SingleShotArgs:
+     the original construction. Masking both sides restores the symmetry the paper's unpaired
+     positives have for free.
+ 
+-    True (default) is the symmetric construction. False reproduces the original asymmetric one;
+-    use it only to reproduce runs from before this change."""
++    True (default) is the symmetric construction, but it also discards the paired alignment
++    signal a_ii * (y_i - x_i). False + drift_tie_self_negative=True is the alternative that keeps
++    it: the self-positive stays and the self-negative is given the matching weight, which removes
++    the residual instead (tied_self_negative_derivation.md). False alone reproduces the original
++    asymmetric construction."""
++
++    drift_tie_self_negative: bool = False
++    """DriftMTP (claudetiedselfnegplan.md): give the query's own detached student state a weight
++    in the NEGATIVE population equal to its self-positive weight a_ii, and scale the other
++    negatives by (1 - a_ii). Removes the spurious a_ii * (x_i - N_i) push that the asymmetric
++    construction (self-positive kept, self-negative masked) leaves at student == teacher, while
++    keeping both the paired pull a_ii * (y_i - x_i) and the unpaired drift. Requires
++    drift_exclude_self_positive=False and drift_use_column_norm=False. False reproduces the
++    current field exactly."""
++
++    drift_freeze_field_scale: bool = False
++    """DriftMTP (claudetiedselfnegplan.md): during LR warmup, normalise each (horizon, tau) field
++    by its live batch RMS lambda_{tau,j} as now, while tracking an EMA of it; at the end of warmup
++    freeze the EMA (DDP-averaged) and divide by the frozen value from then on, so the drift field
++    can fade as the student converges. Checkpointed. False reproduces current behaviour."""
+ 
+     drift_temperatures: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
+     """DriftMTP Phase 4: the base Laplace-kernel temperatures tau (claudedriftingplan.md >
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index 5e43ebd..bef2f9c 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -465,9 +465,20 @@ def _validate_regulariser_flags(ss: SingleShotArgs) -> list:
+     """
+     if ss.smoothl1_enabled and not 0.0 < ss.smoothl1_beta_quantile < 1.0:
+         raise ValueError(f"smoothl1_beta_quantile must be in (0, 1), got {ss.smoothl1_beta_quantile}.")
++    # Tied self-negative (claudetiedselfnegplan.md): only defined for the Eq. 8 field with the
++    # self-positive kept.
++    if ss.drift_tie_self_negative:
++        if ss.drift_exclude_self_positive:
++            raise ValueError("drift_tie_self_negative=True needs drift_exclude_self_positive=False "
++                             "(with the self-positive masked a_ii == 0 and tying is a no-op).")
++        if ss.drift_use_column_norm:
++            raise ValueError("drift_tie_self_negative is only defined for the Eq. 8 field "
++                             "(drift_use_column_norm=False).")
+     warnings_out = []
+     if ss.drift_weight != 0.0 and not ss.drift_enabled:
+         warnings_out.append(f"drift_weight={ss.drift_weight} is ignored because drift_enabled=False.")
++    if (ss.drift_tie_self_negative or ss.drift_freeze_field_scale) and not ss.drift_enabled:
++        warnings_out.append("drift_tie_self_negative / drift_freeze_field_scale are ignored because drift_enabled=False.")
+     if ss.smoothl1_weight != 0.0 and not ss.smoothl1_enabled:
+         warnings_out.append(f"smoothl1_weight={ss.smoothl1_weight} is ignored because smoothl1_enabled=False.")
+     return warnings_out
+@@ -892,6 +903,19 @@ def main(
+         if hparams.singleshot.k_toks_max is not None:
+             k_max = max(k_max, hparams.singleshot.k_toks_max.max_k_toks_value)
+         state["smoothl1_beta"] = SmoothL1BetaState(k_max=k_max, device=fabric.device)
++    # Frozen drift field scale lambda_{tau,j} (claudetiedselfnegplan.md): checkpointed for the
++    # same reason as beta, and only added when enabled, for the same reason.
++    if hparams.singleshot.drift_enabled and hparams.singleshot.drift_freeze_field_scale:
++        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
++        if _driftmtp_src_dir not in sys.path:
++            sys.path.insert(0, _driftmtp_src_dir)
++        from driftmtp.training import DriftFieldScaleState
++        k_max = hparams.singleshot.k_toks.max_k_toks_value
++        if hparams.singleshot.k_toks_max is not None:
++            k_max = max(k_max, hparams.singleshot.k_toks_max.max_k_toks_value)
++        state["drift_field_scale"] = DriftFieldScaleState(
++            k_max=k_max, temperatures=hparams.singleshot.drift_temperatures, device=fabric.device
++        )
+     # MMD kernel bandwidths (horizon 1, frozen after warmup) are checkpointed so a resume
+     # restores them instead of re-estimating from one batch, which shifted the MMD curve.
+     # One per diagnostic hook, under its own key; see docs/geometry_diagnostics_report.md.
+@@ -1224,6 +1248,8 @@ def fit(
+     compute_drift_loss_fn = None
+     drift_accum_tracker = None
+     running_drift_loss = None
++    # None unless drift_freeze_field_scale (state entry created in setup, see above).
++    drift_scale_state = state.get("drift_field_scale")
+     if drift_enabled:
+         assert not hparams.singleshot.gt_teacher_supervision, (
+             "singleshot.drift_enabled requires the student-forced teacher pass, which "
+@@ -1318,6 +1344,9 @@ def fit(
+     torch.cuda.empty_cache()
+ 
+     warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
++    if drift_scale_state is not None and warmup_iters == 0:
++        fabric.print("WARNING: drift_freeze_field_scale with no LR warmup: each horizon's field "
++                     "scale is frozen at its first observation, i.e. from a single batch.")
+ 
+     for train_data in train_iterator:
+         if state["iter_num"] >= max_iters:
+@@ -1739,6 +1768,13 @@ def fit(
+             drift_loss_t0 = time.perf_counter()
+             drift_loss = torch.tensor(0.0, device=fabric.device)
+             if drift_enabled:
++                # Frozen field scale (claudetiedselfnegplan.md): live lambda_{tau,j} during LR
++                # warmup (divisors all NaN), frozen EMA afterwards. Same freeze point as beta.
++                field_scales = None
++                if drift_scale_state is not None:
++                    if not drift_scale_state.frozen and state["iter_num"] - 1 >= warmup_iters:
++                        drift_scale_state.freeze(fabric)
++                    field_scales = drift_scale_state.divisors(k_toks)
+                 drift_result = compute_drift_loss_fn(
+                     student_hidden_full=student_hidden,
+                     teacher_hidden_full=teacher_hidden,
+@@ -1749,8 +1785,12 @@ def fit(
+                     eta=hparams.singleshot.drift_step_size,
+                     use_column_norm=hparams.singleshot.drift_use_column_norm,
+                     exclude_self_positive=hparams.singleshot.drift_exclude_self_positive,
++                    tie_self_negative=hparams.singleshot.drift_tie_self_negative,
++                    field_scales=field_scales,
+                 )
+                 drift_loss = drift_result.loss
++                if drift_scale_state is not None:
++                    drift_scale_state.observe(drift_result.per_horizon_results, k_toks)
+                 drift_accum_tracker.update(drift_result.per_horizon_results, k_toks)
+                 # lambda_drift is a fixed constant for the whole run. It is deliberately
+                 # NOT adapted to hold a constant L_drift/L_MTP ratio: the drift term is
+@@ -2006,8 +2046,11 @@ def fit(
+                     # drift/raw_field_rms_tau_* against eps); a ratio that climbs means
+                     # L_MTP is falling faster than the drift term is fading.
+                     "drift/aux_native_loss_ratio": weighted_drift_loss / (abs(native_mtp_loss) + 1e-8),
++                    "drift/tie_self_negative": float(hparams.singleshot.drift_tie_self_negative),
+                 }
+                 drift_metrics.update(drift_accum_tracker.compute(prefix="drift"))
++                if drift_scale_state is not None:
++                    drift_metrics.update(drift_scale_state.metrics(prefix="drift"))
+                 metrics.update(drift_metrics)
+             # Smooth-L1: global terms under `sl1/`, one wandb section per horizon under
+             # `sl1_h{j}/` (from the tracker). See claudesmoothL1plan.md > Metrics.

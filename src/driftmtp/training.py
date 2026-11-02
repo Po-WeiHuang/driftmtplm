@@ -56,7 +56,7 @@ Implements `claudedriftingplan.md`'s PHASE 4 -- Training Integration:
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
@@ -80,6 +80,8 @@ def compute_drift_loss(
     eta: float = 1.0,
     use_column_norm: bool = True,
     exclude_self_positive: bool = True,
+    tie_self_negative: bool = False,
+    field_scales: Optional[torch.Tensor] = None,
 ) -> DriftLossResult:
     """claudedriftingplan.md PHASE 4: `L_drift^token`, grad-carrying into the student.
 
@@ -97,6 +99,8 @@ def compute_drift_loss(
         `torch.no_grad()` forward pass. `token_drifting_loss` detaches it
         again internally regardless (belt-and-suspenders, per
         claudedriftingplan.md's "Teacher features ... MUST be detached").
+    tie_self_negative, field_scales: see `drifting.token_drifting_loss`;
+        `field_scales` normally comes from `DriftFieldScaleState.divisors(k_toks)`.
     """
     x = extract_predictive_states(
         student_hidden_full, pred_pos_mask, tot_mask_regions, k_toks
@@ -111,6 +115,8 @@ def compute_drift_loss(
         eta=eta,
         use_column_norm=use_column_norm,
         exclude_self_positive=exclude_self_positive,
+        tie_self_negative=tie_self_negative,
+        field_scales=field_scales,
     )
     return DriftLossResult(loss=loss, per_horizon_results=per_horizon_results)
 
@@ -166,6 +172,24 @@ class DriftAccumulationTracker:
         self._anchor_n_eff_pos: Dict[int, Dict[float, deque]] = {}
         self._anchor_n_eff_neg: Dict[int, Dict[float, deque]] = {}
         self._anchor_self_pos_weight: Dict[int, Dict[float, deque]] = {}
+        # claudetiedselfnegplan.md > Metrics: the scaling actually applied, the self-negative
+        # weight, and the paired / unpaired / spurious decomposition of the Eq. 8 field,
+        # keyed by wandb name. A diagnostic that is None (decomposition under column norm)
+        # is not recorded, so its key simply does not appear.
+        self._anchor_tau_extra: Dict[str, Dict[int, Dict[float, deque]]] = {
+            key: {} for key in self._TAU_EXTRA_FIELDS
+        }
+        self._anchor_total_rms: Dict[int, deque] = {}
+
+    # wandb key stem -> TemperatureFieldDiagnostics attribute.
+    _TAU_EXTRA_FIELDS = {
+        "lambda_used": "lambda_used",
+        "self_neg_weight": "self_neg_weight",
+        "field_paired_rms": "paired_rms",
+        "field_unpaired_rms": "unpaired_rms",
+        "field_spurious_rms": "spurious_rms",
+        "field_cos_paired_spurious": "cos_paired_spurious",
+    }
 
     def update(self, per_horizon_results: List[DriftFieldResult], k_toks: int) -> None:
         """Record one micro-substep's per-horizon results, broken out per
@@ -221,6 +245,15 @@ class DriftAccumulationTracker:
                 self._anchor_self_pos_weight.setdefault(j, {}).setdefault(
                     tau, deque(maxlen=self.window)
                 ).append(diag.self_pos_weight)
+                for key, attr in self._TAU_EXTRA_FIELDS.items():
+                    value = getattr(diag, attr)
+                    if value is not None:
+                        self._anchor_tau_extra[key].setdefault(j, {}).setdefault(
+                            tau, deque(maxlen=self.window)
+                        ).append(value)
+            self._anchor_total_rms.setdefault(j, deque(maxlen=self.window)).append(
+                result.total_rms
+            )
 
     def _prune_stale_anchor_horizons(self, current_anchors: List[int]) -> None:
         """Drop any previously-tracked anchor horizon that is NOT part of this
@@ -241,6 +274,9 @@ class DriftAccumulationTracker:
             self._anchor_n_eff_pos.pop(j, None)
             self._anchor_n_eff_neg.pop(j, None)
             self._anchor_self_pos_weight.pop(j, None)
+            for per_key in self._anchor_tau_extra.values():
+                per_key.pop(j, None)
+            self._anchor_total_rms.pop(j, None)
 
     def compute(self, prefix: str = "drift") -> Dict[str, float]:
         """Mean/std/ratio over whatever is currently in the window (up to the
@@ -313,7 +349,114 @@ class DriftAccumulationTracker:
             for tau in self.temperatures:
                 if tau in self._anchor_self_pos_weight[j]:
                     emit(f"self_pos_weight_tau_{tau}_h{j}", self._anchor_self_pos_weight[j][tau])
+        for key, per_horizon in self._anchor_tau_extra.items():
+            for j in sorted(per_horizon):
+                for tau in self.temperatures:
+                    if tau in per_horizon[j]:
+                        emit(f"{key}_tau_{tau}_h{j}", per_horizon[j][tau])
+        for j in sorted(self._anchor_total_rms):
+            emit(f"field_total_rms_h{j}", self._anchor_total_rms[j])
         return out
+
+
+# Warmup EMA decay for the frozen drift field scale, per micro-step; same time constant
+# (10 micro-steps) and rationale as SMOOTHL1_BETA_EMA_DECAY below.
+DRIFT_FIELD_SCALE_EMA_DECAY = 0.9
+
+
+class DriftFieldScaleState:
+    """Per-(horizon j, temperature tau) field scale lambda_{tau,j}: an EMA of the live batch
+    RMS during LR warmup, then frozen (DDP-averaged over the ranks that observed each
+    horizon). See claudetiedselfnegplan.md > Why the Field Scale Must Be Frozen.
+
+    While not frozen, `divisors` is all NaN, so `rms_field_normalize` divides by the live
+    lambda_tau and warmup is bit-identical to the unfrozen path. After the freeze each field
+    is divided by the frozen value, so its normalized RMS is lambda_live / lambda_frozen and
+    can fall as the student converges instead of being renormalized to 1 on every step.
+
+    Same EMA / freeze / late-horizon / checkpoint policy as `SmoothL1BetaState`: seeded by
+    the first observation; a horizon first seen after the freeze takes its live value once
+    (rank-local) and is fixed from then on.
+    """
+
+    def __init__(
+        self,
+        k_max: int,
+        temperatures: Sequence[float],
+        device=None,
+        ema_decay: float = DRIFT_FIELD_SCALE_EMA_DECAY,
+    ):
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
+        self.ema_decay = ema_decay
+        self.temperatures = list(temperatures)
+        self.lam = torch.ones(k_max, len(self.temperatures), device=device)
+        self.seen = torch.zeros(k_max, dtype=torch.bool, device=device)
+        self.frozen = False
+
+    def divisors(self, k_toks: int) -> torch.Tensor:
+        """(k_toks, n_tau): the frozen lambda for frozen, seen horizons; NaN ("use live")
+        everywhere else, and everywhere while not frozen."""
+        if k_toks > self.lam.shape[0]:
+            raise ValueError(f"k_toks ({k_toks}) exceeds k_max ({self.lam.shape[0]})")
+        lam = self.lam[:k_toks]
+        if not self.frozen:
+            return torch.full_like(lam, float("nan"))
+        return torch.where(self.seen[:k_toks, None], lam, torch.full_like(lam, float("nan")))
+
+    @torch.no_grad()
+    def observe(self, per_horizon_results: List[DriftFieldResult], k_toks: int) -> None:
+        if len(per_horizon_results) != k_toks:
+            raise ValueError(
+                f"len(per_horizon_results) ({len(per_horizon_results)}) must equal k_toks ({k_toks})"
+            )
+        if k_toks > self.lam.shape[0]:
+            raise ValueError(f"k_toks ({k_toks}) exceeds k_max ({self.lam.shape[0]})")
+        d = self.ema_decay
+        for j in range(k_toks):
+            if self.frozen and self.seen[j]:
+                continue
+            by_tau = {diag.tau: diag.lambda_tau for diag in per_horizon_results[j].per_temperature}
+            live = torch.tensor(
+                [by_tau[tau] for tau in self.temperatures], dtype=self.lam.dtype, device=self.lam.device
+            )
+            # Unseen horizon (first warmup observation, or first after the freeze): take the
+            # live value outright. Seen horizon during warmup: EMA update.
+            self.lam[j] = torch.where(self.seen[j], d * self.lam[j] + (1.0 - d) * live, live)
+            self.seen[j] = True
+
+    @torch.no_grad()
+    def freeze(self, fabric=None) -> None:
+        """Freeze lambda. With `fabric` and world_size > 1, first replace each seen row by
+        its mean over the ranks that observed horizon j. Collective: every rank must call
+        this on the same iteration."""
+        if fabric is not None and fabric.world_size > 1:
+            seen_f = self.seen.float()
+            lam_sum = fabric.all_reduce(self.lam * seen_f[:, None], reduce_op="sum")
+            count = fabric.all_reduce(seen_f, reduce_op="sum")
+            observed = count > 0
+            self.lam = torch.where(
+                observed[:, None], lam_sum / count.clamp_min(1.0)[:, None], self.lam
+            )
+            self.seen = observed
+        self.frozen = True
+
+    def metrics(self, prefix: str = "drift") -> Dict[str, float]:
+        """`{prefix}/field_scale_frozen` and `{prefix}/lambda_frozen_tau_{tau}_h{j}` for every
+        seen horizon (state, not a per-step statistic, so never stale)."""
+        out: Dict[str, float] = {f"{prefix}/field_scale_frozen": float(self.frozen)}
+        for idx in torch.nonzero(self.seen).flatten().tolist():
+            for t, tau in enumerate(self.temperatures):
+                out[f"{prefix}/lambda_frozen_tau_{tau}_h{idx + 1}"] = self.lam[idx, t].item()
+        return out
+
+    def state_dict(self) -> Dict:
+        return {"lam": self.lam.clone(), "seen": self.seen.clone(), "frozen": self.frozen}
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.lam = state["lam"].to(self.lam.device, self.lam.dtype)
+        self.seen = state["seen"].to(self.seen.device, torch.bool)
+        self.frozen = bool(state["frozen"])
 
 
 # ---------------------------------------------------------------------------
