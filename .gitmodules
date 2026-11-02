@@ -4,3 +4,6 @@
 [submodule "third_party/attention-gym"]
 	path = third_party/attention-gym
 	url = https://github.com/meta-pytorch/attention-gym.git
+[submodule "third_party/lm-evaluation-harness-mtp-lm"]
+	path = third_party/lm-evaluation-harness-mtp-lm
+	url = git@github.com:Po-WeiHuang/lm-evaluation-harness-mtp-lm.git
