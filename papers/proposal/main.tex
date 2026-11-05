@@ -6,8 +6,14 @@
 \PassOptionsToPackage{numbers,sort&compress}{natbib}
 %\usepackage{neurips_2026}
 \usepackage[preprint]{neurips_2026}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
+\usepackage{iftex}
+\ifXeTeX
+  \usepackage{xeCJK}
+  \setCJKmainfont{Songti SC}
+\else
+  \usepackage[utf8]{inputenc}
+  \usepackage[T1]{fontenc}
+\fi
 \usepackage{hyperref}
 \usepackage{url}
 \usepackage{booktabs}
@@ -18,6 +24,8 @@
 \usepackage{float}
 \usepackage{xcolor}
 \usepackage{booktabs}
+
+\newcommand{\myred}[1]{{\color{red}#1}}
 
 \definecolor{mtpOnly}{RGB}{19,159,148}
 \definecolor{drifting}{RGB}{32,189,225}
@@ -137,15 +145,14 @@ parallel generation and model distillation frameworks.
 
 \section{Methods}
 \label{sec:methods}
-We introduce the notation as needed throughout this section.
-For convenience, a consolidated summary of the symbols
-and their definitions is provided in
+We propose a drift-regularized loss for multi-token prediction via self-distillation. We first recap on the MTP framework and its token-level supervision, then introduce the drifting regularization objective, its challenge, our proposed self-negative correction loss. Finally, we describe the proposed experimental design, evaluation metrics, and preliminary results.
+For convenience, notation is provided in
 Appendix~\ref{app:notation}.
-\subsection{On-policy MTP self-distillation}
+\subsection{Preliminaries}
 \label{sec:mtp}
 
-We adopt the multi-token prediction (MTP) framework of
-\citet{kirchenbauer2026mtp}, which converts a pretrained
+Multi-token prediction (MTP) via self-distillation by 
+\citet{kirchenbauer2026mtp} converts a pretrained
 autoregressive language model into a standalone multi-token
 predictor through on-policy self-distillation. The pretrained
 model serves as a frozen teacher, while a student initialized
@@ -171,20 +178,26 @@ This common token objective is retained in every experimental family so that cha
 
 \subsection{Latent-space supervision}
 \label{sec:latent}
-The latent representations of student and teacher prediction tokens are paired at corresponding prediction positions. We introduce SmoothL1 regression as one of the baselines to align each student latent state with its corresponding teacher state, providing direct representation-level supervision to complement the hard-teacher token loss used in MTP training. For active position $i=(r,j)$, let $x_i=\phi_S(u_i^S)$ and $y_i^+=\phi_T(u_i^T)$ denote student and frozen-teacher features under a shared normalization. Paired SmoothL1 regression supplies a direct target for each student state:
+We study how different forms of latent-space supervision affect the geometry of student representations and their alignment with the teacher in MTP via self-distillation. In particular, we propose to investigate how drifting regularization, which encourages population-level alignment, complements pointwise alignment (e.g., SmoothL1) between corresponding student and teacher states. 
+
+\myred{The rest needs to be re-organized following the opening sentence.}
+% We introduce SmoothL1 regression as one of the baselines to align each student latent state with its corresponding teacher state, providing direct representation-level supervision to complement the hard-teacher token loss used in MTP training. 
+
+For active position $i=(r,j)$, let $x_i=\phi_S(u_i^S)$ and $y_i^+=\phi_T(u_i^T)$ denote student and frozen-teacher features under a shared normalization. Paired SmoothL1 regression supplies a direct target for each student state:
 \begin{equation}
  \mathcal L_{\mathrm{SmoothL1}}=\frac{1}{N_{\mathrm{act}}d}
  \sum_{i=1}^{N_{\mathrm{act}}}\sum_{m=1}^{d}
  \rho_\beta\!\left(x_{i,m}-\operatorname{sg}(y^+_{i,m})\right),
 \end{equation}
-where $\rho_\beta(z)=z^2/(2\beta)$ for $|z|<\beta$ and $|z|-\beta/2$ otherwise. This baseline evaluates the benefit of pointwise teacher--student alignment, although enforcing individual correspondences may restrict the flexibility of the student representation distribution.
+where $\rho_\beta(z)=z^2/(2\beta)$ for $|z|<\beta$ and $|z|-\beta/2$ otherwise. The loss promotes a pointwise teacher--student alignment, although enforcing individual correspondences may restrict the flexibility of the student representation distribution.
 
+\myred{Drifting regularization is not a recognized term in the literature. We are adapting the concept of drifting loss to latent-space regularization. Need to first mention about the drift loss and then talk about why using it as a regularization term before introducing the equations.}
 In contrast, drifting constructs a population-level update from interactions between neighbouring teacher and student representations. Drifting regularisation allows the student to approximate the teacher's representation geometry without explicitly enforcing pointwise agreement between corresponding latent states. Following \citet{deng2026drifting}, we use a feature-space Laplace affinity for prediction tokens:
 \begin{equation}
  \kappa_h(x_i,y_l)=\exp\!\left(-\frac{\|x_i-y_l\|_2}{\tau_h}\right).
 \end{equation}
 
-Here, $x_i$ denotes the student latent-state feature at
+\myred{Cannot understand this paragraph. Maybe it's because we have not give context and credit to the original drift loss. Too much new notation before introducing $a^s_{il}$. Beeter start with the context about it, then introduce equation and then notation.} Here, $x_i$ denotes the student latent-state feature at
 prediction position $i$, serving as the anchor for the
 drifting field. The positive pool $\mathcal J_i^+$
 consists of teacher latent-state features $y_l^+$,
@@ -214,14 +227,12 @@ We train against a stopped, drifted target,
  \left\|x_i-\operatorname{sg}\!\left(x_i+
  \eta\frac{\widehat V_i}{\|\widehat V_i\|_2+\epsilon}\right)\right\|_2^2.
 \end{equation}
-Here $\eta$ controls the magnitude of the drift-induced target displacement. Pool composition and horizon grouping are implementation choices, separate from the kernel. Unlike paired regression, this formulation encourages the student representation distribution to approach that of the teacher without requiring exact correspondence between individual latent states.
+Here $\eta$ controls the magnitude of the drift-induced target displacement. Pool composition and horizon grouping are implementation choices, separate from the kernel. \myred{Could use more positive terms like - while and avoid negative terms like - unlike, however, etc when you try to make contrasts.} Unlike paired regression, this formulation encourages the student representation distribution to approach that of the teacher without requiring exact correspondence between individual latent states.
 
 
-Unlike the original drifting formulation for generative
-modelling, on-policy MTP self-distillation provides an
+While MTP self-distillation makes an
 explicit correspondence between each student prediction
-state $x_i$ and its teacher counterpart $y_i^+$.
-Although this correspondence provides additional structural information, it also introduces challenges in constructing balanced positive and negative populations for the drifting field, as discussed in the following section.
+state $x_i$ and its teacher counterpart $y_i^+$, providing additional structural information, it also introduces challenges in constructing balanced positive and negative populations for the drifting field, as discussed in the following section.
 
 \paragraph{Paired self-distillation and self-negative correction}
 \label{sec:self-negative}
@@ -287,6 +298,7 @@ normalization: unpaired teacher features carry
 total weight $1-a_i$, whereas other student features
 retain unit total weight.
 
+\myred{Should start with why you think residual repulstion is a problem and then introduce the tied self-negative construction. Also maybe a different name for the tied-self-negative formualtion? this is not intuitive.}
 To eliminate this residual term, we introduce a
 \emph{tied self-negative} construction that assigns
 the student anchor the same negative weight as its
@@ -320,7 +332,7 @@ Under exact pointwise teacher--student matching,
 the tied field vanishes, unlike the diagonal-masked
 formulation.
 
-We compare drifting with the student anchor excluded
+\myred{Move to proposed experiment} We compare drifting with the student anchor excluded
 from the negative population against the proposed
 tied self-negative construction. This ablation
 investigates whether eliminating the residual
@@ -399,18 +411,13 @@ Free-rollout accuracy is compared against the effective number of emitted tokens
 \end{equation}
 Both fixed-$k$ and confidence-adaptive decoding will be assessed. Measured tokens per second and end-to-end latency will be reported separately, because $k_{\mathrm{eff}}$ is a proxy for acceleration rather than a wall-clock speedup. 
 
-\subsection{Preliminary study and current progress (October 2026)}
+\subsection{Preliminary Results: 1B pilot}
 \label{sec:current-progress}
-
-The 1B pilot investigates how different forms of latent
-supervision affect teacher--student representation geometry
-and downstream multi-token generation. In particular, we
-examine whether the tied self-negative correction improves
+We conducted preliminary experiments on a 1B-parameter model to evaluate the effects of different latent supervision objectives on representation geometry and token generation. 
+In particular, we examine whether the tied self-negative correction improves
 the alignment properties of conventional drifting while
 preserving its population-level geometric behaviour.
-The on-policy MTP reproduction is complete; the current
-results are exploratory single-run comparisons rather than
-controlled multi-seed evaluations. The four experimental
+The experimental
 configurations are summarized in Table~\ref{tab:variants}.
 
 \paragraph{Geometric spread: drifting preserves relative dispersion.}
@@ -432,6 +439,7 @@ does not establish complete distributional alignment.
 \caption[Effect of latent regularization on feature spread at horizon 3]{
 \textbf{Effect of latent regularization on relative feature
 spread at prediction horizon $h=3$.}
+\myred{very challenging to read. Maybe increase the font size? also the student/teacher ratio is not clear. Should put the definition to appendix or make citation in text.}
 The horizontal axis represents the global training step,
 while the vertical axis shows the ratio of the student's
 mean pairwise latent-state feature distance to that of
