@@ -4,16 +4,34 @@
 % Default: anonymous Main Track submission with line numbers.
 % For a non-anonymous draft, use \usepackage[preprint]{neurips_2026}.
 \PassOptionsToPackage{numbers,sort&compress}{natbib}
-\usepackage{neurips_2026}
-
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
+%\usepackage{neurips_2026}
+\usepackage[preprint]{neurips_2026}
+\usepackage{iftex}
+\ifXeTeX
+  \usepackage{xeCJK}
+  \setCJKmainfont{Songti SC}
+\else
+  \usepackage[utf8]{inputenc}
+  \usepackage[T1]{fontenc}
+\fi
 \usepackage{hyperref}
 \usepackage{url}
 \usepackage{booktabs}
 \usepackage{amsmath}
 \usepackage{amsfonts}
 \usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\newcommand{\myred}[1]{{\color{red}#1}}
+
+\definecolor{mtpOnly}{RGB}{19,159,148}
+\definecolor{drifting}{RGB}{32,189,225}
+\definecolor{driftBandwidth}{RGB}{155,217,205}
+\definecolor{smoothLone}{RGB}{219,53,212}
+\definecolor{combined}{RGB}{255,161,125}
 
 \title{Drift-Regularized Multi-Token Prediction via On-Policy Self-Distillation}
 
@@ -21,7 +39,7 @@
 % They are hidden in the default anonymous submission mode.
 \author{%
   Po-Wei Huang, Feng-Ting Liao \\
-  Department of Computer Science, University of Oxford \\
+  Department of Physics, University of Oxford \\
   MediaTek Research
 }
 
@@ -39,276 +57,552 @@
 %  tokens strictly sequentially. Multi-token prediction (MTP) addresses this by
 % predicting a block of future tokens in a single forward pass. However, training
 % MTP models solely via token-level cross-entropy leaves a representation gap:
-% parallel hidden states lack explicit guidance on how to organize intermediate
+% parallel latent states lack explicit guidance on how to organize intermediate
 % predictive representations. We propose a drift-regularized self-distillation
 % framework that constructs a local conditional attraction--repulsion field to
-% align student hidden-state populations with teacher feature distributions.
+% align student latent-state populations with teacher feature distributions.
 % Unlike paired mean squared error (MSE), this objective does not require
 % point-to-point Euclidean matching. We will test whether conditional drift
 % improves task accuracy, calibration, latent-space alignment, and the
-% accuracy--acceleration trade-off relative to token-only MTP and paired MSE.
+% accuracy--acceleration trade-off relative to token-only MTP and paired SmoothL1.
 % \end{abstract}
 
-\section{objective}
+
+\section{Objective}
 \label{sec:objective}
-Standard next-token prediction generates one token per step, incurring high
-memory-bandwidth overhead and inference latency during long-form generation and
-reasoning-intensive tasks. MTP mitigates this bottleneck by generating a
-contiguous block of $k$ tokens in a single forward pass. We build on on-policy
-self-distillation, in which a student proposes future tokens at inserted mask
-positions and a frozen teacher supplies supervision conditioned on the
-student-generated continuation~\citep{kirchenbauer2026mtp}.
 
-Our objective is to reduce the capability loss that accompanies longer parallel
-prediction horizons. We will test the hypothesis that, at comparable realized
-acceleration, token-only MTP is outperformed by MTP with paired latent MSE,
-which is in turn outperformed by MTP with conditional drift. Success will be
-assessed through task scores relative to the original sequential teacher,
-confidence calibration, held-out feature-distribution diagnostics, and measured
-throughput and latency. This ordering is a hypothesis to be tested rather than
-an established result.
+This research investigates latent representation alignment in
+policy distillation, aiming to improve multi-token generation
+beyond supervision based solely on token-level predictions.
+While conventional knowledge distillation primarily constrains
+output distributions, the geometry of intermediate latent
+representations remains underdetermined.
 
-\section{novelty}
+
+Our goal is to establish how latent geometric alignment
+can improve the accuracy--efficiency trade-off in
+multi-token prediction. To this end, we develop a
+geometry-aware drifting regularizer that aligns student
+and teacher latent-state distributions, and compare it
+with conventional token-level supervision and paired
+feature regression. We will like to demonstrate that population-level drifting offers advantages over pointwise regression and token-level alignment in terms of better thoughput and latency while maintaining or improving reasoning accuracy. 
+
+
+
+
+\section{Novelty}
 \label{sec:novelty}
-A correct token prediction constrains relative logit margins without uniquely
-determining the hidden representation. Consequently, newly inserted MTP mask
-states must learn parallel future-token computations without explicit
-supervision over their representation geometry. Work on feature-based
-speculative decoding, including EAGLE~\citep{li2024eagle}, motivates addressing
-feature uncertainty; NextLat~\citep{teoh2025nextlatent} also provides motivation
-for auxiliary prediction in latent space.
 
-Paired MSE supplies dense supervision but imposes a one-to-one Euclidean match
-between each parallel student state and its sequential teacher counterpart.
-Our proposed contribution is to adapt population-level drifting
-\citep{deng2026drifting} to conditional MTP representation alignment. A local
-vector field attracts student states toward teacher feature neighborhoods and
-repels them from crowded student neighborhoods. Conditioning interactions on
-prediction horizon and prefix context is intended to preserve relevant local
-structure. We will compare horizon-wise alignment with block-level alignment
-to determine whether modeling inter-token feature dependencies improves chunk
-coherence.
+Our contributions are twofold: introducing drifting
+regularization~\citep{deng2026drifting} as a latent-space
+supervision objective for multi-token prediction (MTP)
+self-distillation, and systematically investigating how
+its attraction--repulsion components, sampling strategies,
+and hyperparameters influence representation alignment
+and generation performance.
 
-\section{impact}
+First, we adapt drifting to language-model hidden
+representations, where teacher states serve as positive
+samples and other student states form the negative
+population. The resulting attraction--repulsion field
+encourages population-level alignment without enforcing
+exact pointwise correspondence, providing an alternative
+to conventional paired feature regression
+(Section~\ref{sec:methods}).
+
+Second, we decompose the drifting formulation into three
+components to examine their respective contributions
+and identify suitable sampling strategies
+(Section~\ref{sec:self-negative}). We further investigate
+how these design choices affect the alignment of
+teacher and student feature distributions and their
+relationship to multi-token rollout performance.
+
+\section{Impact}
 \label{sec:impact}
-If successful, this approach could extend the usable parallel prediction horizon
-while retaining more of the sequential model's reasoning capability. The
-regularizer is applied during training and adds no inference module to the
-standalone MTP model. The intended practical benefit is improved generation
-quality at a given latency or greater throughput at a given quality target.
-These benefits require system measurements and cannot be inferred from the
-configured block size alone.
 
-The study will also provide a controlled comparison of output-only supervision,
-pointwise feature regression, and population-level feature alignment. Reporting
-calibration separately from latent distribution distances will help distinguish
-reliable confidence from representation matching. A later extension could apply
-the same conditional regularizer to a speculative drafter such as
-DFlash~\citep{chen2026dflash}; the initial study will focus on standalone MTP.
+We hypothesize that improved latent representation alignment
+can enhance multi-token prediction beyond the gains achievable
+through token-level self-distillation alone. In particular,
+preserving the teacher's representation geometry may help
+the student maintain coherent and distinguishable predictive
+states across longer prediction horizons, potentially improving
+generation quality without sacrificing parallelism.
+
+The proposed approach could enable the model to produce
+more reliable tokens per forward pass, thereby reducing
+generation latency and increasing token throughput under
+standalone MTP inference. Since drifting regularization is
+applied only during training, it introduces no additional
+inference module or verification stage.
+
+More broadly, this study aims to clarify the relationship
+between representation geometry, token-level prediction
+quality, and the accuracy--acceleration trade-off in
+self-distilled language models. Such findings could inform
+the design of representation-level supervision for other
+parallel generation and model distillation frameworks.
 
 \section{Methods}
 \label{sec:methods}
+We propose a drift-regularized loss for multi-token prediction via self-distillation. We first recap on the MTP framework and its token-level supervision, then introduce the drifting regularization objective, its challenge, our proposed self-negative correction loss. Finally, we describe the proposed experimental design, evaluation metrics, and preliminary results.
+For convenience, notation is provided in
+Appendix~\ref{app:notation}.
+\subsection{Preliminaries}
+\label{sec:mtp}
 
-\subsection{On-policy MTP self-distillation}
-For training region $r$, let $c_r$ denote a context prefix and $k_r$ the number
-of future predictions. Following~\citet{kirchenbauer2026mtp}, the flattened
-student input inserts $k_r-1$ trainable \texttt{<MTP>} mask tokens. Repeated
-position IDs and a blocked causal attention mask allow active prediction states
-to attend to the prefix and preceding masks without altering copied context
-representations. At horizon $j$, the student produces hidden state $u^S_{r,j}$
-and token distribution $p^S_{r,j}$. Its greedy proposal is
-$\hat y_{r,j}=\arg\max_v p^S_{r,j}(v)$.
+Multi-token prediction (MTP) via self-distillation by 
+\citet{kirchenbauer2026mtp} converts a pretrained
+autoregressive language model into a standalone multi-token
+predictor through on-policy self-distillation. The pretrained
+model serves as a frozen teacher, while a student initialized
+from the same checkpoint learns to predict multiple future
+tokens simultaneously. The teacher evaluates the student's
+proposed continuation autoregressively, providing token-level
+supervision without requiring an additional verification model
+during inference.
 
-The frozen teacher is evaluated on the student-forced continuation:
-\begin{equation}
-  u^T_{r,j}=H_{\theta_T}(c_r,\hat y_{r,<j}),
-  \qquad
-  \bar y_{r,j}=\arg\max_v p_{\theta_T}(v\mid c_r,\hat y_{r,<j}).
-\end{equation}
-With $N_{\mathrm{act}}=\sum_r k_r$, the hard on-policy distillation loss is
-\begin{equation}
-  \mathcal L_{\mathrm{MTP}}
-  =-\frac{1}{N_{\mathrm{act}}}\sum_{r,j}
-    \log p^S_{r,j}(\bar y_{r,j}).
-\end{equation}
-For active index $i=(r,j)$, let $x_i=\phi_S(u^S_i)$ and
-$y_i^+=\phi_T(u^T_i)$ be features in a shared latent space, using the same
-normalization. Detached student features $y_l^-=\operatorname{sg}(x_l)$ form
-the negative population, where $\operatorname{sg}$ denotes stop-gradient.
+During the training, for each region $r$, a prefix $c_r$ is followed by $k_r-1$ trainable \texttt{<MTP>} mask tokens, allowing the student to propose $k_r$ future tokens in one forward pass. Repeated position IDs and blocked causal attention preserve the original context computation while allowing each prediction state to attend to the prefix and preceding masks. At horizon $j$, the student produces latent state $u^S_{r,j}$ and distribution $p^S_{r,j}$, yielding a greedy proposal $\hat y_{r,j}=\arg\max_v p^S_{r,j}(v)$.
 
-\subsection{Latent regularization}
-We compare the unified objective
+The teacher then supplies targets on the continuation actually proposed by the student, rather than on a fixed ground-truth continuation. With a frozen autoregressive teacher,
 \begin{equation}
-  \mathcal L=\mathcal L_{\mathrm{MTP}}+\lambda_R\mathcal L_R,
-  \qquad R\in\{\mathrm{MSE},\mathrm{drift}\}.
+ u^T_{r,j}=H_{\theta_T}(c_r,\hat y_{r,<j}),\qquad
+ \bar y_{r,j}=\arg\max_v p_{\theta_T}(v\mid c_r,\hat y_{r,<j}).
 \end{equation}
-The paired regression baseline is
+The hard-teacher token objective is
 \begin{equation}
-  \mathcal L_{\mathrm{MSE}}
-  =\frac{1}{N_{\mathrm{act}}}\sum_i
-    \left\|x_i-\operatorname{sg}(y_i^+)\right\|_2^2.
+ \mathcal L_{\mathrm{MTP}}=-\frac{1}{N_{\mathrm{act}}}\sum_{r,j}
+ \log p^S_{r,j}(\bar y_{r,j}),\qquad N_{\mathrm{act}}=\sum_r k_r.
 \end{equation}
-For conditional drift, teacher and detached student pools $\mathcal I_i^+$ and
-$\mathcal I_i^-$ interact through
-\begin{equation}
-  \kappa_{\mathrm{cond}}(i,l;y_l)
-  =\kappa_h(x_i,y_l)\,
-    \kappa_c(g(c_i),g(c_l))\,\mathbf 1[a_i=a_l],
-\end{equation}
-where $a_i=j$ identifies the prediction horizon, $g(c_i)$ is a detached prefix
-embedding, and $\kappa_h$ and $\kappa_c$ are nonnegative distance kernels over
-features and context, respectively. For $s\in\{+,-\}$, define
-$\mathcal J_i^+=\mathcal I_i^+$ and
-$\mathcal J_i^-=\mathcal I_i^-\setminus\{i\}$. Normalize affinities as
-\begin{equation}
-  a^s_{il}
-  =\frac{\kappa_{\mathrm{cond}}(i,l;y_l^s)}
-  {\sum_{m\in\mathcal J_i^s}\kappa_{\mathrm{cond}}(i,m;y_m^s)+\epsilon},
-  \qquad l\in\mathcal J_i^s,
-\end{equation}
-with $\epsilon>0$ for numerical stability. The self-excluded drift estimate is
-\begin{equation}
-  \widehat V_i
-  =\sum_{l\in\mathcal J_i^+}a^+_{il}(y_l^+-x_i)
-   -\sum_{l\in\mathcal J_i^-}a^-_{il}(y_l^--x_i).
-\end{equation}
-Following the stopped-target construction of drifting models
-\citep{deng2026drifting}, the auxiliary objective is
-\begin{equation}
-  \mathcal L_{\mathrm{drift}}
-  =\frac{1}{N_{\mathrm{act}}}\sum_i
-  \left\|x_i-\operatorname{sg}\!\left(
-    x_i+\eta\frac{\widehat V_i}{\|\widehat V_i\|_2+\epsilon}
-  \right)\right\|_2^2,
-\end{equation}
-where $\eta$ controls the target displacement. The block-level variant applies
-the same construction to concatenated normalized block features,
-$b_r^S=k_r^{-1/2}\operatorname{vec}[x_{r,1};\ldots;x_{r,k_r}]$, and their
-teacher counterparts, grouping blocks of the same length.
+This common token objective is retained in every experimental family so that changes in rollout behaviour can be attributed more clearly to the added representation losses.
 
-\subsection{Controlled comparisons}
-The planned variants are summarized in Table~\ref{tab:variants}. We will keep
-initialization, data, and training budgets comparable. During warm-up at fixed
-$k=3$, we will sweep $\lambda_R\in[10^{-4},10^{-1}]$ and target an auxiliary-to-token
-gradient-norm ratio of approximately $0.10$. We will then freeze the loss
-coefficient and evaluate static block sizes $k\in\{2,3,4,5\}$, with an extended
-sweep to $k=6,7$ if feasible. Training cost and memory will be reported alongside
-inference performance.
+\subsection{Latent-space supervision}
+\label{sec:latent}
+We study how different forms of latent-space supervision affect the geometry of student representations and their alignment with the teacher in MTP via self-distillation. In particular, we propose to investigate how drifting regularization, which encourages population-level alignment, complements pointwise alignment (e.g., SmoothL1) between corresponding student and teacher states. 
+
+\myred{The rest needs to be re-organized following the opening sentence.}
+% We introduce SmoothL1 regression as one of the baselines to align each student latent state with its corresponding teacher state, providing direct representation-level supervision to complement the hard-teacher token loss used in MTP training. 
+
+For active position $i=(r,j)$, let $x_i=\phi_S(u_i^S)$ and $y_i^+=\phi_T(u_i^T)$ denote student and frozen-teacher features under a shared normalization. Paired SmoothL1 regression supplies a direct target for each student state:
+\begin{equation}
+ \mathcal L_{\mathrm{SmoothL1}}=\frac{1}{N_{\mathrm{act}}d}
+ \sum_{i=1}^{N_{\mathrm{act}}}\sum_{m=1}^{d}
+ \rho_\beta\!\left(x_{i,m}-\operatorname{sg}(y^+_{i,m})\right),
+\end{equation}
+where $\rho_\beta(z)=z^2/(2\beta)$ for $|z|<\beta$ and $|z|-\beta/2$ otherwise. The loss promotes a pointwise teacher--student alignment, although enforcing individual correspondences may restrict the flexibility of the student representation distribution.
+
+\myred{Drifting regularization is not a recognized term in the literature. We are adapting the concept of drifting loss to latent-space regularization. Need to first mention about the drift loss and then talk about why using it as a regularization term before introducing the equations.}
+In contrast, drifting constructs a population-level update from interactions between neighbouring teacher and student representations. Drifting regularisation allows the student to approximate the teacher's representation geometry without explicitly enforcing pointwise agreement between corresponding latent states. Following \citet{deng2026drifting}, we use a feature-space Laplace affinity for prediction tokens:
+\begin{equation}
+ \kappa_h(x_i,y_l)=\exp\!\left(-\frac{\|x_i-y_l\|_2}{\tau_h}\right).
+\end{equation}
+
+\myred{Cannot understand this paragraph. Maybe it's because we have not give context and credit to the original drift loss. Too much new notation before introducing $a^s_{il}$. Beeter start with the context about it, then introduce equation and then notation.} Here, $x_i$ denotes the student latent-state feature at
+prediction position $i$, serving as the anchor for the
+drifting field. The positive pool $\mathcal J_i^+$
+consists of teacher latent-state features $y_l^+$,
+including the teacher state paired with $x_i$
+(self-positive configuration). The negative pool
+$\mathcal J_i^-$ consists of other student latent-state
+features $y_l^-$, excluding the anchor itself
+($l \neq i$). Both pools provide feature samples
+against which the anchor is compared, with teacher
+states contributing attraction and other student
+states contributing repulsion. For
+$s\in\{+,-\}$, the within-pool affinities are
+
+\begin{equation}
+ a^s_{il}=\frac{\kappa_h(x_i,y_l^s)}
+ {\sum_{m\in\mathcal J_i^s}\kappa_h(x_i,y_m^s)+\epsilon},
+ \qquad l\in\mathcal J_i^s,
+\end{equation}
+with $y_l^-=\operatorname{sg}(x_l)$. Teacher neighbours attract the student state while student neighbours supply a repulsive term:
+\begin{equation}\label{drift_pos_neg}
+ \widehat V_i=\sum_{l\in\mathcal J_i^+}a^+_{il}(y_l^+-x_i)
+ -\sum_{l\in\mathcal J_i^-}a^-_{il}(y_l^--x_i).
+\end{equation}
+We train against a stopped, drifted target,
+\begin{equation}
+ \mathcal L_{\mathrm{drift}}=\frac{1}{N_{\mathrm{act}}}\sum_i
+ \left\|x_i-\operatorname{sg}\!\left(x_i+
+ \eta\frac{\widehat V_i}{\|\widehat V_i\|_2+\epsilon}\right)\right\|_2^2.
+\end{equation}
+Here $\eta$ controls the magnitude of the drift-induced target displacement. Pool composition and horizon grouping are implementation choices, separate from the kernel. \myred{Could use more positive terms like - while and avoid negative terms like - unlike, however, etc when you try to make contrasts.} Unlike paired regression, this formulation encourages the student representation distribution to approach that of the teacher without requiring exact correspondence between individual latent states.
+
+
+While MTP self-distillation makes an
+explicit correspondence between each student prediction
+state $x_i$ and its teacher counterpart $y_i^+$, providing additional structural information, it also introduces challenges in constructing balanced positive and negative populations for the drifting field, as discussed in the following section.
+
+\paragraph{Paired self-distillation and self-negative correction}
+\label{sec:self-negative}
+
+The construction of the positive and negative pools
+$\mathcal J_i^+$ and $\mathcal J_i^-$ requires careful
+consideration of sample selection. In particular, including
+the student anchor itself in the negative pool or retaining
+its paired teacher representation in the positive pool
+can introduce undesirable weighting effects. We therefore
+introduce a correction to mitigate these issues which will be introduced at the end of this section.
+
+
+Directly including the student anchor $x_i$ in the
+negative population can cause its self-affinity
+$\kappa_h(x_i,x_i)=1$ to dominate the normalized negative
+weights, despite producing zero displacement.
+Conversely, including the paired teacher $y_i^+$ in
+the positive population while excluding $x_i$ from
+the negative population introduces an asymmetric
+weighting of paired and unpaired interactions.
+
+To characterize this asymmetry, we define the normalized
+paired-teacher affinity $a_i$, the weighted mean $P_i$
+of other teacher features, and the weighted mean $N_i$
+of other student features:
+\begin{equation}
+\begin{aligned}
+a_i &= a_{ii}^{+},\\
+P_i &= \frac{1}{1-a_i}
+       \sum_{j\neq i}a_{ij}^{+}y_j^{+},\\
+N_i &= \sum_{j\neq i}a_{ij}^{-}x_j.
+\end{aligned}
+\label{eq:population_means}
+\end{equation}
+Here, $a_{ij}^{+}$ and $a_{ij}^{-}$ are the
+row-normalized teacher and student affinities,
+respectively, with the student diagonal excluded
+from $a_{ij}^{-}$. The definition of $P_i$ applies
+when $a_i<1$; otherwise its weighted contribution
+vanishes.
+
+The resulting drifting field admits a three-term
+decomposition:
+\begin{equation}
+\begin{aligned}
+\widehat V_i^{\mathrm{masked}}
+={}&
+\underbrace{a_i(y_i^+-x_i)}_{\text{paired attraction}}\\
+&+
+\underbrace{(1-a_i)(P_i-N_i)}_{\text{population correction}}\\
+&+
+\underbrace{a_i(x_i-N_i)}_{\text{residual repulsion}}.
+\end{aligned}
+\label{eq:masked_decomposition}
+\end{equation}
+The first term attracts the student towards its
+paired teacher, while the second captures the
+difference between the remaining teacher and
+student populations. The third term is an additional
+repulsive contribution caused by the mismatch in
+normalization: unpaired teacher features carry
+total weight $1-a_i$, whereas other student features
+retain unit total weight.
+
+\myred{Should start with why you think residual repulstion is a problem and then introduce the tied self-negative construction. Also maybe a different name for the tied-self-negative formualtion? this is not intuitive.}
+To eliminate this residual term, we introduce a
+\emph{tied self-negative} construction that assigns
+the student anchor the same negative weight as its
+paired teacher's positive weight:
+\begin{equation}
+\widetilde a_{ij}^{-}=
+\begin{cases}
+a_i, & j=i,\\
+(1-a_i)a_{ij}^{-}, & j\neq i.
+\end{cases}
+\label{eq:tied_negative}
+\end{equation}
+This preserves the normalization
+$\sum_j\widetilde a_{ij}^{-}=1$
+while maintaining the relative affinities among
+other student features. The resulting field becomes
+\begin{equation}
+\boxed{
+\widehat V_i^{\mathrm{tied}}
+=
+a_i(y_i^+-x_i)
++
+(1-a_i)(P_i-N_i).
+}
+\label{eq:tied_drift}
+\end{equation}
+Although the self-negative contributes no direct
+displacement, its assigned weight reduces the
+repulsive contribution from other student states.
+Under exact pointwise teacher--student matching,
+the tied field vanishes, unlike the diagonal-masked
+formulation.
+
+\myred{Move to proposed experiment} We compare drifting with the student anchor excluded
+from the negative population against the proposed
+tied self-negative construction. This ablation
+investigates whether eliminating the residual
+repulsive term improves representation alignment
+and downstream multi-token prediction performance.
+
+
+\subsection{Experimental design: drifting and its baselines}
+\label{sec:comparisons}
+The experiments are designed to distinguish the effects of population-level alignment, pointwise feature regression, and self-negative correction. M0 provides the token-only reference, while M1 and M2 compare diagonal-masked drifting against paired SmoothL1 regression. M3 introduces the tied self-negative construction described in Section 4.3, isolating the effect of correcting the asymmetric attraction–repulsion weighting. All configurations retain the same hard-teacher MTP objective to enable controlled comparisons.
 
 \begin{table}[t]
-  \caption{Planned objective variants and their diagnostic roles.}
-  \label{tab:variants}
-  \centering
-  \begin{tabular}{lll}
-    \toprule
-    ID & Objective & Diagnostic role \\
-    \midrule
-    M0 & Hard on-policy MTP & Token-only baseline \\
-    M1 & M0 + paired latent MSE & Pointwise alignment \\
-    M2 & M0 + conditional full drift & Attraction and repulsion \\
-    M3 & M0 + attraction-only drift & Repulsion ablation \\
-    M4 & M0 + block-level full drift & Joint block coherence \\
-    M5 & Soft on-policy KL distillation & Soft token supervision \\
-    \bottomrule
-  \end{tabular}
+\centering
+\caption{Training objectives and experimental configurations.
+M0 provides the token-only baseline, M1 and M2 compare
+population-level drifting with pointwise feature regression,
+and M3 evaluates the tied self-negative correction described
+in Section~\ref{sec:self-negative}.
+The legend labels are used consistently across figures.}
+\label{tab:variants}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}p{0.07\linewidth}
+                  p{0.27\linewidth}
+                  p{0.28\linewidth}
+                  p{0.28\linewidth}@{}}
+\toprule
+\textbf{ID} &
+\textbf{Figure legend} &
+\textbf{Training objective} &
+\textbf{Purpose}\\
+\midrule
+
+M0 &
+\texttt{MTPloss} &
+Hard-teacher MTP only &
+Token-supervision baseline\\
+
+M1 &
+\texttt{Drift+MTPloss} &
+MTP + diagonal-masked drifting &
+Population-level alignment baseline\\
+
+M2 &
+\texttt{SmoothL1+MTPloss} &
+MTP + paired SmoothL1 &
+Pointwise feature-regression baseline\\
+
+M3 &
+\texttt{TieDrift+MTPloss} &
+MTP + tied self-negative drifting &
+Self-negative correction ablation
+(Section~\ref{sec:self-negative})\\
+
+\bottomrule
+\end{tabular}
 \end{table}
 
-\subsection{Evaluation and decision rules}
-Training will use mathematical reasoning traces from GSM8K and MetaMathQA.
-The primary evaluations will cover GSM8K, AIME25, and GPQA Main; broader
-capability checks will include BBH, IFEval, and CNN/DailyMail. We will report
-task accuracy, instruction-following scores, and ROUGE-L as appropriate. The
-frozen teacher under sequential decoding ($k=1$) provides the capability-retention
-reference. All model-selection decisions will use held-out validation data.
+We will compare these families at matched initialization, data exposure, and evaluation settings wherever feasible. In the pilot configurations, the drifting coefficient $w_{\mathrm{drift}}=0.05$ corresponds to an approximately 30\% auxiliary-to-token gradient-norm ratio; SmoothL1 with $w_{\mathrm{SmoothL1}}=0.53$ corresponds to approximately 20\%.
 
-We will measure token-level expected calibration error (ECE), following the
-calibration perspective of~\citet{joshi2025calibration}. Separately, we will
-compare teacher and student feature populations using sliced Wasserstein-2,
-maximum mean discrepancy~\citep{gretton2012kernel}, Sinkhorn transport cost
-\citep{cuturi2013sinkhorn}, and 1-nearest-neighbor two-sample accuracy, with
-complementary distributional diagnostics motivated by
-\citet{esteban2026kernel}. Features will use shared normalization and any PCA
-projection fitted only on training features. Diagnostics will be reported per
-horizon; nearest-neighbor accuracy approaching $50\%$ indicates reduced
-population distinguishability under balanced sampling.
+\subsection{Evaluation: from feature geometry to rollout performance}
+\label{sec:evaluation}
+A geometric improvement matters for this proposal only if its relationship to generation can be measured. We therefore separate latent diagnostics from end-to-end rollout outcomes. The current pilot uses MetaMathQA for training and GSM8K for free-rollout evaluation; broader benchmarks will be chosen for larger checkpoints. The frozen autoregressive teacher under sequential decoding ($k=1$) is the capability-retention reference.
 
-We will evaluate both static and confidence-adaptive decoding. Realized token
-acceleration is
+Feature spread, maximum mean discrepancy (MMD)~\citep{gretton2012kernel}, and Sinkhorn transport cost~\citep{cuturi2013sinkhorn} assess different aspects of teacher--student geometry.We also evaluate token-level expected calibration error
+(ECE)~\citep{joshi2025calibration} to assess how closely
+the model's predicted token confidence reflects its
+empirical prediction accuracy. All metrics are reported separately for each prediction
+horizon to isolate horizon-dependent effects and avoid
+confounding trends arising from aggregating predictions
+across different horizons.
+Free-rollout accuracy is compared against the effective number of emitted tokens per decoding pass,
 \begin{equation}
-  k_{\mathrm{eff}}
-  =\frac{\text{emitted non-padding tokens}}
-        {\text{decoding forward passes}},
+ k_{\mathrm{eff}}=\frac{\text{emitted non-padding tokens}}
+ {\text{decoding forward passes}}.
 \end{equation}
-which will be reported alongside measured throughput and end-to-end latency.
-For a single operating-point summary, validation will select the fastest
-setting within one percentage point of the sequential teacher's validation
-accuracy, when such a setting exists; it will then be frozen for test evaluation.
-We will report uncertainty over evaluation examples and, where feasible,
-training seeds. If MSE outperforms drift, or token-only training outperforms
-both regularizers, we will report that outcome and examine sampling noise,
-regularization strength, and conditioning rather than assume the proposed
-ordering holds.
+Both fixed-$k$ and confidence-adaptive decoding will be assessed. Measured tokens per second and end-to-end latency will be reported separately, because $k_{\mathrm{eff}}$ is a proxy for acceleration rather than a wall-clock speedup. 
+
+\subsection{Preliminary Results: 1B pilot}
+\label{sec:current-progress}
+We conducted preliminary experiments on a 1B-parameter model to evaluate the effects of different latent supervision objectives on representation geometry and token generation. 
+In particular, we examine whether the tied self-negative correction improves
+the alignment properties of conventional drifting while
+preserving its population-level geometric behaviour.
+The experimental
+configurations are summarized in Table~\ref{tab:variants}.
+
+\paragraph{Geometric spread: drifting preserves relative dispersion.}
+Figure~\ref{fig:spread} compares the ratio of mean pairwise
+student and teacher feature distances at prediction horizon
+$h=3$. Paired SmoothL1 regression produces the strongest
+contraction of student representations, whereas conventional
+drifting maintains a spread ratio close to unity.
+The tied self-negative formulation exhibits similarly
+preserved feature dispersion, suggesting that correcting
+the asymmetric repulsive field does not substantially
+compromise this property of drifting.
+However, agreement in average pairwise distance alone
+does not establish complete distributional alignment.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.7\linewidth]{spread_ratio.png}
+\caption[Effect of latent regularization on feature spread at horizon 3]{
+\textbf{Effect of latent regularization on relative feature
+spread at prediction horizon $h=3$.}
+\myred{very challenging to read. Maybe increase the font size? also the student/teacher ratio is not clear. Should put the definition to appendix or make citation in text.}
+The horizontal axis represents the global training step,
+while the vertical axis shows the ratio of the student's
+mean pairwise latent-state feature distance to that of
+the frozen teacher. A ratio of 1 indicates equal average
+feature spread, whereas values below 1 indicate contraction
+of student representations relative to the teacher.
+Paired SmoothL1 regression produces the strongest
+contraction (approximately 0.82), while conventional
+drifting and the token-only baseline maintain ratios
+close to unity (approximately 1.03).
+The tied self-negative formulation achieves an
+intermediate ratio (approximately 0.95), preserving
+more feature dispersion than SmoothL1 while exhibiting
+slightly greater contraction than conventional drifting.
+The experimental configurations corresponding to
+each legend entry are defined in Table~\ref{tab:variants}.
+}
+
+
+
+\label{fig:spread}
+\end{figure}
+\paragraph{Distribution alignment: tied drifting improves short-horizon matching.}
+Figure~\ref{fig:dist} evaluates teacher--student alignment
+using maximum mean discrepancy (MMD) and Sinkhorn
+transport cost across prediction horizons.
+Conventional drifting generally improves MMD relative
+to token-only MTP at longer horizons, but exhibits
+weaker alignment at the first prediction position.
+The tied self-negative formulation reduces this
+short-horizon discrepancy, particularly at $k=1$,
+while maintaining comparable MMD at longer horizons.
+This behaviour is consistent with the proposed
+self-negative correction: excluding the student anchor
+while retaining its paired teacher introduces an
+additional repulsive contribution
+$a_i(x_i-N_i)$, which may displace student features
+away from their paired teacher representations.
+Removing this residual term may therefore be
+particularly beneficial at short horizons, where
+the prediction state more closely resembles the
+next-token prediction (NTP) setting.
+Nevertheless, the Sinkhorn results show that
+SmoothL1 remains competitive, indicating that
+different regularizers favour distinct aspects
+of representation alignment.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{MMDSinkhorn.png}
+\caption{\textbf{Tied self-negative drifting improves short-horizon distribution alignment.} Maximum mean discrepancy (MMD; left) and Sinkhorn transport cost (right) between student and frozen-teacher feature distributions across prediction horizons. Lower values indicate closer agreement under the respective metrics. Conventional drifting improves MMD relative to token-only MTP at longer horizons but exhibits a larger discrepancy at \(k=1\). The tied self-negative correction reduces this short-horizon MMD while maintaining comparable performance at longer horizons. SmoothL1 achieves lower Sinkhorn costs across the evaluated horizons, highlighting differences between distributional matching criteria.}
+\label{fig:dist}
+\end{figure}
+\paragraph{Rollout performance: geometric alignment and generation accuracy.}
+The practical objective is to improve generation accuracy
+at a given effective number of emitted tokens per pass.
+Figure~\ref{fig:acc} compares GSM8K free-rollout accuracy
+against effective $k$ under confidence-adaptive and
+fixed-$k$ decoding.
+Both drifting formulations generally improve the
+accuracy--acceleration trade-off relative to token-only
+MTP over much of the evaluated range.
+The tied self-negative formulation remains competitive
+with conventional drifting and achieves higher accuracy
+at several intermediate operating points, although
+neither method consistently dominates.
+SmoothL1 also remains competitive, particularly at
+selected operating points.
+These preliminary results suggest that correcting
+the self-negative interaction can improve short-horizon
+representation alignment without sacrificing the
+generation benefits associated with population-level
+regularization. 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{accuracy_effective_k.png}
+\caption{\textbf{Accuracy–acceleration trade-off under different latent regularization objectives.} GSM8K free-rollout exact-match accuracy versus the effective number of emitted tokens per forward pass for the 1B pilot models. Filled markers connected by solid lines represent confidence-adaptive decoding, while open markers and dashed lines indicate fixed-(k) decoding. Both conventional and tied self-negative drifting generally improve accuracy over token-only MTP at comparable effective prediction horizons. Tied drifting remains competitive with conventional drifting, with improvements at several intermediate operating points. Error bars indicate evaluation standard errors. Higher accuracy and larger effective (k) are preferable, although effective (k) does not directly measure wall-clock acceleration.}
+\label{fig:acc}
+\end{figure}
+
+These pilots establish a concrete next step: determine which geometric properties are predictive of rollout quality, and where pointwise regression, drifting, or their combination is preferable. The 8B study will repeat the comparisons with matched budgets, broader bandwidth and horizon sweeps, and stronger validation before moving to the final larger-model experiment.
 
 \section{Risks}
 \label{sec:risks}
-\paragraph{Noisy or mismatched feature populations.}
-Conditional drift depends on the size and relevance of local teacher and
-student pools. Sparse horizon groups or unrelated contexts may produce noisy
-updates. We will monitor pool sizes, kernel affinities, feature norms, and
-per-horizon diagnostics; cap or subsample pools for tractability; and retain
-paired MSE and attraction-only drift as diagnostic alternatives. Updates with
-insufficient pool support will be skipped.
+\paragraph{The wrong neighbours can give the wrong drift.}
+A teacher feature may be close in Euclidean distance without representing a comparable prediction context. Small or heterogeneous pools could therefore push the student in unhelpful directions, especially at longer horizons. We will inspect pool composition and kernel weights by horizon, vary bandwidth and pool size, and omit updates when too few usable neighbours are available.
 
-\paragraph{Overregularization and misleading alignment.}
-Forcing feature alignment may reduce token accuracy or encourage feature
-collapse. Matched auxiliary gradient strength and coefficient sweeps will help
-separate the effect of the regularizer from loss scaling. Lower latent distances
-or ECE alone will not be treated as evidence of improved reasoning: task scores
-and the teacher-retention gap remain necessary checks.
+\paragraph{A better-looking feature space may not generate better answers.}
+The pilot already shows why feature distances cannot be the sole success criterion: SmoothL1 and drifting change spread and transport cost differently. Strong regularization may also damage the token objective. We will compare methods at similar auxiliary gradient strengths and judge improvements primarily by free-rollout accuracy at matched effective $k$, followed by measured throughput and latency.
 
-\paragraph{Training overhead and deployment trade-offs.}
-Pairwise kernel interactions increase training compute and memory, and a larger
-configured block size need not yield proportional wall-clock speedup. We will
-bound population sizes and profile teacher passes, kernel computation, and
-training memory. Deployment comparisons will use identical hardware, batch
-sizes, prompt lengths, and generation limits.
+\paragraph{Training overhead versus inference gains.}
+Drifting introduces additional computational overhead
+during training through pairwise feature interactions,
+which may limit its practicality at larger model scales.
+We will measure training wall-clock time to quantify
+this additional cost and compare inference latency
+and token throughput across different training objectives.
+These measurements will establish whether improvements
+in generation quality and inference efficiency justify
+the additional training cost.ference gain.
 
-\paragraph{Generalization and evaluation validity.}
-Training on mathematical traces may degrade other capabilities, motivating the
-broader evaluation suite. Validation and test splits will remain separate, and
-training data will be checked for benchmark overlap. Faster generation may also
-amplify existing model errors; capability retention and confidence calibration
-will be assessed before making practical deployment claims.
+\paragraph{Results on one maths benchmark may not transfer.}
+The current evidence comes from MetaMathQA-trained models evaluated on GSM8K. It does not establish benefits for other reasoning tasks or open-ended generation. Larger-model evaluation will therefore include held-out tasks beyond GSM8K, with benchmark overlap checked and model-selection data kept separate from final tests.
 
-\section{Timeline \& Resources}
+\section{Timeline \& Resource Requirements}
 \label{sec:timeline-resources}
-% Planning additions: the source manuscript specifies neither a calendar nor
-% a hardware allocation. Durations and budgets below remain to be confirmed.
-The work will proceed through four phases. Dates and durations remain to be
-confirmed against the available compute allocation.
+The baseline reproduction is complete, and the current work is moving from 1B pilot diagnostics to controlled hyperparameter selection and larger-model validation. The remaining phases depend on compute availability.
 \begin{enumerate}
-  \item \textbf{Baseline reproduction:} establish the on-policy MTP pipeline,
-    sequential teacher reference, paired MSE baseline, and evaluation harness.
-  \item \textbf{Drift implementation and pilot:} implement conditional pools,
-    self-exclusion, and stopped-target updates; profile memory and runtime;
-    calibrate regularization strength at $k=3$.
-  \item \textbf{Main experiments and ablations:} run the block-size and
-    confidence-threshold sweeps, compare all objective variants, and collect
-    task, calibration, and latent-alignment measurements.
-  \item \textbf{Analysis and reporting:} quantify uncertainty, analyze failure
-    cases and capability retention, and prepare reproducible configurations
-    and the final manuscript.
+ \item \textbf{Completed:} reproduce on-policy MTP, establish the frozen-teacher reference, and validate free-rollout evaluation.
+ \item \textbf{Ongoing:} compare drifting, SmoothL1, and combined losses at 1B; examine feature geometry and the effects of kernel bandwidth and training horizon.
+ \item \textbf{Next:} use an 8B model to select hyperparameters under matched training budgets, with repeated evaluations and additional reasoning benchmarks.
+ \item \textbf{Final study:} transfer the selected settings to a 32B mixture-of-experts (MoE) model and measure accuracy, effective $k$, throughput, and latency.
 \end{enumerate}
 
-Required resources include a pretrained autoregressive checkpoint, a frozen
-teacher copy, GPUs with sufficient memory for student training and teacher
-forward passes, checkpoint storage, and held-out evaluation data. A pilot run
-will determine feasible batch and pool sizes and measure GPU-hours per run;
-the total budget will then be estimated from the planned configurations and
-seeds. The checkpoint, GPU type and count, storage budget, personnel allocation,
-and phase durations are \textbf{TBD}.
+\paragraph{Computing resource request.}
+For 2 billion training tokens and a frozen teacher, we estimate approximately 10 hours of idealized compute for an 8B dense model using four NVIDIA B200 GPUs at 40\% model FLOPs utilization. We request access to four B200 GPUs for approximately two days per 8B configuration to allow for MTP-specific overhead, evaluation, and profiling. Multiple configurations and seeds would require additional allocations. The final 32B MoE run will be budgeted after profiling its active-parameter compute and full-model memory requirements. Access to GPUs, storage, and large-model training support from the University of Oxford Department of Computer Science and the MediaTek Computing Research Centre would help complete the proposed comparisons.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
 
+\section{Notation Reference}
+\label{app:notation}
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of notation used in the methodology.}
+\label{tab:notation}
+\small
+\begin{tabular}{ll}
+\toprule
+Symbol & Definition \\
+\midrule
+$i=(r,j)$ & Active prediction position in region $r$, horizon $j$ \\
+$r$ & MTP prediction region index \\
+$j$ & Prediction horizon within an MTP region \\
+$N_{\mathrm{act}}$ & Number of active prediction positions \\
+$d$ & Dimension of the latent feature space \\
+\midrule
+$S,T$ & Student and frozen teacher models \\
+$u_i^S,u_i^T$ & Student and teacher hidden states at position $i$ \\
+$\phi_S,\phi_T$ & Student and teacher feature normalization maps \\
+$x_i$ & Normalized student latent representation \\
+$y_i^+$ & Corresponding normalized teacher representation \\
+$y_l^-$ & Detached student representation used as a negative \\
+$\operatorname{sg}(\cdot)$ & Stop-gradient operation \\
+\midrule
+$\mathcal J_i^+$ & Positive (teacher) sample pool for anchor $i$ \\
+$\mathcal J_i^-$ & Negative (student) sample pool for anchor $i$ \\
+$\kappa_h$ & Laplace affinity kernel in feature space \\
+$\tau_h$ & Kernel temperature (distance scale) \\
+$a_{il}^+$ & Normalized positive affinity weight \\
+$a_{il}^-$ & Normalized negative affinity weight \\
+$\widehat V_i$ & Estimated drifting field at anchor $x_i$ \\
+$\eta$ & Drift target displacement scale \\
+$\epsilon$ & Numerical stability constant \\
+\midrule
+$\mathcal L_{\mathrm{SmoothL1}}$ & Paired latent-state regression loss \\
+$\rho_\beta$ & SmoothL1 penalty function \\
+$\beta$ & SmoothL1 quadratic-to-linear transition threshold \\
+$\mathcal L_{\mathrm{drift}}$ & Drifting regularization loss \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \end{document}
+
