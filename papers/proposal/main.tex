@@ -191,7 +191,7 @@ where $\rho_\beta(z)=z^2/(2\beta)$ for $|z|<\beta$ and $|z|-\beta/2$ otherwise. 
 
 
 
-Drifting loss was originally introduced in the context of generative modelling by \citet{deng2026drifting}, providing an alternative perspective on distributional alignment. Rather than enforcing pointwise correspondence between individual samples, drifting constructs a vector field that drives the generated distribution towards the target distribution through attraction and repulsion. Specifically, generated samples are attracted towards samples from the target distribution while being repelled from samples drawn from the generated distribution. The resulting drifting field vanishes when the two distributions match, establishing an equilibrium.
+In contrast, the drifting loss was originally introduced in the context of generative modelling by \citet{deng2026drifting}, providing an alternative perspective on distributional alignment. Rather than enforcing pointwise correspondence between individual samples, drifting constructs a vector field that drives the generated distribution towards the target distribution through attraction and repulsion. Specifically, generated samples are attracted towards samples from the target distribution while being repelled from samples drawn from the generated distribution. The resulting drifting field vanishes when the two distributions match, establishing an equilibrium.
 
 We extend this principle to the MTP setting by treating the teacher and student hidden-state representations as samples from the target and generated distributions, respectively. This enables population-level alignment through interactions among teacher and student representations, without explicitly enforcing pointwise agreement between corresponding latent states. In our framework, the drifting loss serves as an auxiliary regularisation term alongside the original token-level prediction loss, encouraging the student to learn the teacher's representation geometry while maintaining accurate token predictions.
 
@@ -224,7 +224,7 @@ We train against a stopped, drifted target,
  \left\|x_i-\operatorname{sg}\!\left(x_i+
  \eta\frac{\widehat V_i}{\|\widehat V_i\|_2+\epsilon}\right)\right\|_2^2.
 \end{equation}
-Here $\eta$ controls the magnitude of the drift-induced target displacement. Pool composition and horizon grouping are implementation choices, separate from the kernel. \myred{Could use more positive terms like - while and avoid negative terms like - unlike, however, etc when you try to make contrasts.} Unlike paired regression, this formulation encourages the student representation distribution to approach that of the teacher without requiring exact correspondence between individual latent states.
+Here $\eta$ controls the magnitude of the drift-induced target displacement. Pool composition and horizon grouping are implementation choices, separate from the kernel. Rather than enforcing exact correspondence between individual latent states through paired regression, this formulation encourages the student representation distribution to align with that of the teacher.
 
 
 While MTP self-distillation makes an
@@ -329,6 +329,7 @@ repulsive contribution from other student states.
 Under exact pointwise teacher--student matching,
 the tied field vanishes, unlike the diagonal-masked
 formulation.
+
 
 
 
@@ -446,17 +447,12 @@ does not establish complete distributional alignment.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=0.7\linewidth]{spread_ratio.png}
+\includegraphics[width=0.85\linewidth]{spread_ratio.png}
 \caption[Effect of latent regularization on feature spread at horizon 3]{
 \textbf{Effect of latent regularization on relative feature
 spread at prediction horizon $h=3$.}
-<<<<<<< HEAD
-\myred{very challenging to read. Maybe increase the font size? also the student/teacher ratio is not clear. Should put the definition to appendix or make citation in text.}
-The horizontal axis represents the global training step,
-=======
 
 The horizontal axis represents the micro training step,
->>>>>>> 4b1af37 (Revision from FT's Comments)
 while the vertical axis shows the ratio of the student's
 mean pairwise latent-state feature distance to that of
 the frozen teacher. Paired SmoothL1 regression produces the strongest
