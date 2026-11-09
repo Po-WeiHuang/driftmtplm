@@ -180,15 +180,8 @@ This common token objective is retained in every experimental family so that cha
 \label{sec:latent}
 We study how different forms of latent-space supervision affect the geometry of student representations and their alignment with the teacher in MTP via self-distillation. In particular, we propose to investigate how drifting regularization, which encourages population-level alignment, complements pointwise alignment (e.g., SmoothL1) between corresponding student and teacher states. 
 
-<<<<<<< HEAD
-\myred{The rest needs to be re-organized following the opening sentence.}
-% We introduce SmoothL1 regression as one of the baselines to align each student latent state with its corresponding teacher state, providing direct representation-level supervision to complement the hard-teacher token loss used in MTP training. 
-
-For active position $i=(r,j)$, let $x_i=\phi_S(u_i^S)$ and $y_i^+=\phi_T(u_i^T)$ denote student and frozen-teacher features under a shared normalization. Paired SmoothL1 regression supplies a direct target for each student state:
-=======
 
 We introduce SmoothL1 regression as one of the baselines to align each student latent state with its corresponding teacher state, providing direct representation-level supervision to complement the hard-teacher token loss used in MTP training. For active position $i=(r,j)$, let $x_i=\phi_S(u_i^S)$ and $y_i^+=\phi_T(u_i^T)$ denote student and frozen-teacher features under a shared normalization. Paired SmoothL1 regression supplies a direct target for each student state:
->>>>>>> 4b1af37 (Revision from FT's Comments)
 \begin{equation}
  \mathcal L_{\mathrm{SmoothL1}}=\frac{1}{N_{\mathrm{act}}d}
  \sum_{i=1}^{N_{\mathrm{act}}}\sum_{m=1}^{d}
@@ -196,40 +189,19 @@ We introduce SmoothL1 regression as one of the baselines to align each student l
 \end{equation}
 where $\rho_\beta(z)=z^2/(2\beta)$ for $|z|<\beta$ and $|z|-\beta/2$ otherwise. The loss promotes a pointwise teacher--student alignment, although enforcing individual correspondences may restrict the flexibility of the student representation distribution.
 
-<<<<<<< HEAD
-\myred{Drifting regularization is not a recognized term in the literature. We are adapting the concept of drifting loss to latent-space regularization. Need to first mention about the drift loss and then talk about why using it as a regularization term before introducing the equations.}
-In contrast, drifting constructs a population-level update from interactions between neighbouring teacher and student representations. Drifting regularisation allows the student to approximate the teacher's representation geometry without explicitly enforcing pointwise agreement between corresponding latent states. Following \citet{deng2026drifting}, we use a feature-space Laplace affinity for prediction tokens:
-=======
 
 
-In contrast, the drifting loss was originally introduced in the context of generative modelling by \citet{deng2026drifting}, providing an alternative perspective on distributional alignment. Rather than enforcing pointwise correspondence between individual samples, drifting constructs a vector field that drives the generated distribution towards the target distribution through attraction and repulsion. Specifically, generated samples are attracted towards samples from the target distribution while being repelled from samples drawn from the generated distribution. The resulting drifting field vanishes when the two distributions match, establishing an equilibrium.
+Drifting loss was originally introduced in the context of generative modelling by \citet{deng2026drifting}, providing an alternative perspective on distributional alignment. Rather than enforcing pointwise correspondence between individual samples, drifting constructs a vector field that drives the generated distribution towards the target distribution through attraction and repulsion. Specifically, generated samples are attracted towards samples from the target distribution while being repelled from samples drawn from the generated distribution. The resulting drifting field vanishes when the two distributions match, establishing an equilibrium.
 
 We extend this principle to the MTP setting by treating the teacher and student hidden-state representations as samples from the target and generated distributions, respectively. This enables population-level alignment through interactions among teacher and student representations, without explicitly enforcing pointwise agreement between corresponding latent states. In our framework, the drifting loss serves as an auxiliary regularisation term alongside the original token-level prediction loss, encouraging the student to learn the teacher's representation geometry while maintaining accurate token predictions.
 
 Following \citet{deng2026drifting}, we adopt a feature-space Laplace affinity to quantify the similarity between latent-state representations:
->>>>>>> 4b1af37 (Revision from FT's Comments)
 \begin{equation}
  \kappa_h(x_i,y_l)=\exp\!\left(-\frac{\|x_i-y_l\|_2}{\tau_h}\right),
 \end{equation}
 where $\tau_h>0$ is a temperature parameter controlling the sensitivity of the affinity to distances in the hidden-state space.
 
-<<<<<<< HEAD
-\myred{Cannot understand this paragraph. Maybe it's because we have not give context and credit to the original drift loss. Too much new notation before introducing $a^s_{il}$. Beeter start with the context about it, then introduce equation and then notation.} Here, $x_i$ denotes the student latent-state feature at
-prediction position $i$, serving as the anchor for the
-drifting field. The positive pool $\mathcal J_i^+$
-consists of teacher latent-state features $y_l^+$,
-including the teacher state paired with $x_i$
-(self-positive configuration). The negative pool
-$\mathcal J_i^-$ consists of other student latent-state
-features $y_l^-$, excluding the anchor itself
-($l \neq i$). Both pools provide feature samples
-against which the anchor is compared, with teacher
-states contributing attraction and other student
-states contributing repulsion. For
-$s\in\{+,-\}$, the within-pool affinities are
-=======
 For each prediction position $i$, the student hidden-state representation $x_i$ serves as an anchor for constructing the drifting field. We define a positive pool $\mathcal J_i^+$ consisting of teacher hidden-state representations $y_l^+$. Similarly, the negative pool $\mathcal J_i^-$ consists of student hidden-state representations $y_l^-$, where $y_l^-=\operatorname{sg}(x_l)$ and $\operatorname{sg}(\cdot)$ denotes the stop-gradient operation.
->>>>>>> 4b1af37 (Revision from FT's Comments)
 
 To determine the relative contribution of each representation to the drifting field, we normalise the affinities independently within the positive and negative pools. For $s\in\{+,-\}$, denoting the positive and negative pools respectively, the normalised affinity weights are defined as
 \begin{equation}
@@ -323,12 +295,8 @@ normalization: unpaired teacher features carry
 total weight $1-a_i$, whereas other student features
 retain unit total weight.
 
-<<<<<<< HEAD
-\myred{Should start with why you think residual repulstion is a problem and then introduce the tied self-negative construction. Also maybe a different name for the tied-self-negative formualtion? this is not intuitive.}
-=======
 
 The residual term may introduce an undesirable drift even when the teacher and student distributions are perfectly aligned on a pairwise basis. In this scenario, both the pairwise and population-level contributions vanish, whereas the residual term arising from the negative pool $\mathcal J_i^-$ remains nonzero. Consequently, the residual term continues to push the anchor away from its equilibrium position, disrupting the balance between attraction and repulsion.
->>>>>>> 4b1af37 (Revision from FT's Comments)
 To eliminate this residual term, we introduce a
 \emph{tied self-negative} construction that assigns
 the student anchor the same negative weight as its
@@ -362,16 +330,6 @@ Under exact pointwise teacher--student matching,
 the tied field vanishes, unlike the diagonal-masked
 formulation.
 
-<<<<<<< HEAD
-\myred{Move to proposed experiment} We compare drifting with the student anchor excluded
-from the negative population against the proposed
-tied self-negative construction. This ablation
-investigates whether eliminating the residual
-repulsive term improves representation alignment
-and downstream multi-token prediction performance.
-=======
-
->>>>>>> 4b1af37 (Revision from FT's Comments)
 
 
 \subsection{Experimental design: drifting and its baselines}
