@@ -10,23 +10,27 @@ selected by the training step's own `pred_pos_mask` (so exactly the positions th
 supervises; tail-padded regions are already dropped from that mask upstream), with the
 original pairing (s_i, t_i) kept by row index. From the three Euclidean distance matrices
 D_SS, D_TT, D_ST of that horizon, the module derives every metric in the plan, including
-MMD (ignite's estimator with the paired cross terms added back, see
-`metrics.mmd.paired_maximum_mean_discrepancy`; bandwidth from horizon 1's D^2) and Sinkhorn
-(D_ST is its ground cost). Each matrix is built once per horizon, in the
-hidden states' own dtype (bf16 under bf16-true training), and released before the next
-horizon.
+MMD (ignite's estimator with the paired cross terms added back, from D^2, see
+`metrics.mmd.mmd_from_sq_dists(paired=True)`; bandwidth from horizon 1's D^2), Sinkhorn
+(D_ST is its ground cost; eps from horizon 1's d_st_std, see
+`metrics.sinkhorn.SinkhornEpsilonSchedule`) and the energy distance (from the three matrices'
+means, see `energy_distance_from_means`). `stat_match*` (L_SM, arXiv:2003.04289 Eq. 4) is taken from the
+states directly, see `statistics_matching`. The matrices are built once per horizon and step,
+in float32 (`diagnostic_distances`), and passed as arguments to every metric -- and, when
+both hooks run on the same micro-iteration and population, to `validation`'s `drift_diag/`
+hook as well, which then builds none of its own.
 
 Keys: `{prefix}/h{h}/{metric}` for every horizon 1..k_toks this step. There is
 deliberately no cross-horizon average: comparisons between setups are made at a fixed h.
 """
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
 from .features import extract_predictive_states
-from .metrics.mmd import MMDBandwidthSchedule, paired_maximum_mean_discrepancy
-from .metrics.sinkhorn import sinkhorn_from_cost
+from .metrics.mmd import MMDBandwidthSchedule, mmd_from_sq_dists
+from .metrics.sinkhorn import SinkhornEpsilonSchedule, sinkhorn_from_cost
 
 GEOMETRY_EPS = 1e-8
 
@@ -56,6 +60,8 @@ METRIC_NAMES = (
     "paired_teacher_rank_mean",
     "paired_teacher_rank_median",
     "student_teacher_spread_ratio",
+    "energy_distance",
+    "energy_distance_normalized",
     "teacher_nn_internal_mean",
     "teacher_nn_internal_std",
     "teacher_duplicate_fraction",
@@ -65,6 +71,9 @@ METRIC_NAMES = (
     "normalized_pairing_gap_std",
     "mmd",
     "sinkhorn",
+    "stat_match",
+    "stat_match_mean_term",
+    "stat_match_std_term",
 )
 
 
@@ -92,7 +101,29 @@ def pairwise_distance_matrices(
 
 
 def _mean_std(v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Reduced in at least float32: a bf16 result keeps ~3 significant digits, and the
+    # energy distance is a small difference of these means.
+    v = v.to(torch.promote_types(v.dtype, torch.float32))
     return v.mean(), v.std(unbiased=False)
+
+
+def energy_distance_from_means(d_st_mean, pair_distance_mean, d_ss_mean, d_tt_mean, n):
+    """Energy distance (Szekely & Rizzo) from one horizon's already-computed distance means:
+
+        ED = 2 E|S - T| - E|S - S'| - E|T - T'|
+
+    d_ss_mean / d_tt_mean exclude the zero diagonals and d_st_mean averages all n^2 cross
+    pairs, the n paired distances included. Those paired terms are taken back out,
+
+        d_st_off = (n * d_st_mean - pair_distance_mean) / (n - 1),
+
+    so every term is a U-statistic over distinct indices: the estimate is unbiased, does not
+    use the pairing, and can come out slightly negative when the two populations match.
+    ED >= 0 in expectation and is 0 only for identical distributions; the -E|S - S'| term
+    makes a contracted (under-dispersed) student score worse, not better.
+    """
+    d_st_off = (n * d_st_mean - pair_distance_mean) / (n - 1)
+    return 2 * d_st_off - d_ss_mean - d_tt_mean
 
 
 @torch.no_grad()
@@ -102,13 +133,15 @@ def metrics_from_distances(
     d_st: torch.Tensor,
     eps: float = GEOMETRY_EPS,
 ) -> Dict[str, torch.Tensor]:
-    """Every per-horizon metric except `mmd` from one horizon's distance matrices
-    (`mmd` runs ignite on the states themselves, see `compute_geometry_diagnostics`).
+    """Every per-horizon metric except `mmd`, `sinkhorn` and `stat_match*` from one horizon's
+    distance matrices (see `compute_geometry_diagnostics`: `mmd` and `stat_match*` use the
+    states themselves, and `sinkhorn` needs the shared eps).
 
     Returns 0-dim tensors keyed by `METRIC_NAMES`, left on device so the caller can move
-    every horizon's values to the host in one transfer. Distance-derived values keep the
-    input dtype; the count-based ones (num_samples, NN fraction, rank) are float32 so
-    integers above 256 stay exact. Stds are population stds (unbiased=False).
+    every horizon's values to the host in one transfer. Means / stds are reduced in at least
+    float32; the per-row ratios are formed in the input dtype. The count-based ones
+    (num_samples, NN fraction, rank) are float32 so integers above 256 stay exact. Stds are
+    population stds (unbiased=False).
     """
     n = d_ss.shape[0]
     off = ~torch.eye(n, dtype=torch.bool, device=d_ss.device)
@@ -141,6 +174,12 @@ def metrics_from_distances(
 
     out["student_teacher_spread_ratio"] = out["d_ss_mean"] / (out["d_tt_mean"] + eps)
 
+    # Pairing-free and contraction-sensitive; from the means above, no new distances.
+    out["energy_distance"] = energy_distance_from_means(
+        out["d_st_mean"], out["pair_distance_mean"], out["d_ss_mean"], out["d_tt_mean"], n
+    )
+    out["energy_distance_normalized"] = out["energy_distance"] / (out["d_tt_mean"] + eps)
+
     # Teacher local scale: nearest OTHER teacher.
     d_tt_nn = d_tt.masked_fill(~off, float("inf")).min(dim=1).values
     out["teacher_nn_internal_mean"], out["teacher_nn_internal_std"] = _mean_std(d_tt_nn)
@@ -155,11 +194,37 @@ def metrics_from_distances(
     local = d_tt_nn[keep] + eps
     out["pair_over_teacher_local_mean"], out["pair_over_teacher_local_std"] = _mean_std(d_pair[keep] / local)
     out["normalized_pairing_gap_mean"], out["normalized_pairing_gap_std"] = _mean_std(gap[keep] / local)
-
-    # Sinkhorn's ground cost is the Euclidean D_ST itself. The solver runs in float32: its
-    # 100 dual updates in bf16 alone added ~1% error (vs ~0.02% in float32).
-    out["sinkhorn"] = sinkhorn_from_cost(d_st.float())
     return out
+
+
+@torch.no_grad()
+def statistics_matching(
+    s: torch.Tensor, t: torch.Tensor, eps: float = GEOMETRY_EPS
+) -> Dict[str, torch.Tensor]:
+    """L_SM of Yang et al. 2020, "Knowledge distillation via adaptive instance
+    normalization" (arXiv:2003.04289), Sec. 3.2, Eqs. (2)-(4), on (N, d) states.
+
+    The paper's channels c are the d hidden dimensions and its H*W spatial positions are
+    the N tokens of one horizon's ensemble, so mu^c / sigma^c are each dimension's mean
+    and spread over the ensemble (Eq. 2; Eq. 3 with eps inside the sqrt, population var):
+        L_SM = 1/d sum_c [(mu_T^c - mu_S^c)^2 + (sigma_T^c - sigma_S^c)^2]      (Eq. 4)
+    Pairing-free: it compares the two ensembles' first and second moments only.
+    `stat_match_mean_term` / `stat_match_std_term` are the two summands, each averaged
+    over d, so they add up to `stat_match`. Runs in at least float32 (bf16 sums over N
+    quantise the moments).
+    """
+    dtype = torch.promote_types(s.dtype, torch.float32)
+    s, t = s.to(dtype), t.to(dtype)
+    mu_s, mu_t = s.mean(dim=0), t.mean(dim=0)
+    sigma_s = (s.var(dim=0, unbiased=False) + eps).sqrt()
+    sigma_t = (t.var(dim=0, unbiased=False) + eps).sqrt()
+    mean_term = (mu_t - mu_s).square().mean()
+    std_term = (sigma_t - sigma_s).square().mean()
+    return {
+        "stat_match": mean_term + std_term,
+        "stat_match_mean_term": mean_term,
+        "stat_match_std_term": std_term,
+    }
 
 
 @torch.no_grad()
@@ -192,6 +257,46 @@ def gather_predictive_states(
     return s_all, t_all
 
 
+class DiagnosticDistances(NamedTuple):
+    """One step's predictive states and every horizon's distance matrices, built once.
+
+    `s`, `t`: (n, k, d_h) float32 states. `matrices[h - 1]` is horizon h's float32
+    `(D_SS, D_TT, D_ST)` from `pairwise_distance_matrices`. Shared by the `diag/` and
+    `drift_diag/` hooks of the same micro-iteration so neither rebuilds them.
+    """
+
+    s: torch.Tensor
+    t: torch.Tensor
+    matrices: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+
+
+@torch.no_grad()
+def diagnostic_distances(
+    student_hidden_full: torch.Tensor,
+    teacher_hidden_full: torch.Tensor,
+    pred_pos_mask: torch.Tensor,
+    tot_mask_regions: int,
+    k_toks: int,
+    gather_fn: Optional[Callable] = None,
+) -> Optional[DiagnosticDistances]:
+    """Extract (and optionally gather) the predictive states, then build D_SS / D_TT / D_ST
+    once per horizon. None when fewer than 2 samples are available.
+
+    float32, not the hidden states' bf16: MMD is built from these same matrices, and bf16's
+    ~0.4% per-entry rounding swamps a small MMD^2 (see `metrics.mmd.mmd_from_sq_dists`).
+    At the diagnostic population (n ~ 32 per rank) float32 costs nothing.
+    """
+    s = extract_predictive_states(student_hidden_full, pred_pos_mask, tot_mask_regions, k_toks).detach()
+    t = extract_predictive_states(teacher_hidden_full, pred_pos_mask, tot_mask_regions, k_toks).detach()
+    if gather_fn is not None:
+        s, t = gather_fn(s, t)
+    if s.shape[0] < 2:
+        return None
+    s, t = s.float(), t.float()
+    matrices = [pairwise_distance_matrices(s[:, idx], t[:, idx]) for idx in range(s.shape[1])]
+    return DiagnosticDistances(s, t, matrices)
+
+
 @torch.no_grad()
 def compute_geometry_diagnostics(
     student_hidden_full: torch.Tensor,
@@ -200,10 +305,12 @@ def compute_geometry_diagnostics(
     tot_mask_regions: int,
     k_toks: int,
     bandwidth_schedule: MMDBandwidthSchedule,
+    sinkhorn_epsilon_schedule: SinkhornEpsilonSchedule,
     step: int,
     gather_fn: Optional[Callable] = None,
     prefix: str = "diag",
     eps: float = GEOMETRY_EPS,
+    distances: Optional[DiagnosticDistances] = None,
 ) -> Dict[str, float]:
     """Per-horizon geometry metrics for one training step.
 
@@ -215,33 +322,44 @@ def compute_geometry_diagnostics(
         bandwidth_schedule: this hook's own `MMDBandwidthSchedule`, kept in the
             checkpointed training state. Updated from horizon 1's distance matrices and
             shared by every horizon.
-        step: optimizer step, the schedule's warmup unit.
+        sinkhorn_epsilon_schedule: this hook's own `SinkhornEpsilonSchedule`, also
+            checkpointed. Updated from horizon 1's d_st_std and shared by every horizon.
+        step: optimizer step, both schedules' warmup unit.
         gather_fn: optional `(s, t) -> (s_all, t_all)` that pools states across ranks
             (see `gather_predictive_states`); None keeps the rank-local population.
+        distances: this micro-iteration's `diagnostic_distances(...)`, already built for
+            the SAME population (same gather_fn); None builds them here.
 
     Returns:
         Flat `{key: float}`; empty if fewer than 2 samples are available.
     """
-    s = extract_predictive_states(student_hidden_full, pred_pos_mask, tot_mask_regions, k_toks).detach()
-    t = extract_predictive_states(teacher_hidden_full, pred_pos_mask, tot_mask_regions, k_toks).detach()
-    if gather_fn is not None:
-        s, t = gather_fn(s, t)
-    n, num_horizons = s.shape[0], s.shape[1]
-    if n < 2:
+    if distances is None:
+        distances = diagnostic_distances(
+            student_hidden_full, teacher_hidden_full, pred_pos_mask, tot_mask_regions, k_toks, gather_fn
+        )
+    if distances is None:
         return {}
+    s, t = distances.s, distances.t
+    num_horizons = s.shape[1]
 
     per_horizon = []
     bandwidth = None
-    for idx in range(num_horizons):
-        d_ss, d_tt, d_st = pairwise_distance_matrices(s[:, idx], t[:, idx])
+    sinkhorn_eps = None
+    # Every distance-based metric below takes horizon idx's three matrices as arguments; none
+    # rebuilds them. MMD and the bandwidth use their squares.
+    for idx, (d_ss, d_tt, d_st) in enumerate(distances.matrices):
+        d2_ss, d2_tt, d2_st = d_ss.square(), d_tt.square(), d_st.square()
         if idx == 0:
-            bandwidth = bandwidth_schedule.update_from_sq_dists(
-                step, d_ss.square(), d_tt.square(), d_st.square()
-            )
+            bandwidth = bandwidth_schedule.update_from_sq_dists(step, d2_ss, d2_tt, d2_st)
         metrics = metrics_from_distances(d_ss, d_tt, d_st, eps=eps)
-        metrics["mmd"] = paired_maximum_mean_discrepancy(s[:, idx], t[:, idx], bandwidth)
+        if idx == 0:
+            sinkhorn_eps = sinkhorn_epsilon_schedule.update(step, metrics["d_st_std"])
+        # Sinkhorn's ground cost is the Euclidean D_ST itself (float32, see diagnostic_distances).
+        metrics["sinkhorn"] = sinkhorn_from_cost(d_st, epsilon=sinkhorn_eps)
+        metrics["mmd"] = mmd_from_sq_dists(d2_ss, d2_tt, d2_st, bandwidth, paired=True)
+        metrics.update(statistics_matching(s[:, idx], t[:, idx], eps=eps))
         per_horizon.append(torch.stack([metrics[name].float() for name in METRIC_NAMES]))
-        del d_ss, d_tt, d_st, metrics
+        del d2_ss, d2_tt, d2_st, metrics
 
     values = torch.stack(per_horizon).tolist()  # (num_horizons, num_metrics), one host sync
     del per_horizon, s, t
@@ -249,6 +367,7 @@ def compute_geometry_diagnostics(
     out: Dict[str, float] = {
         f"{prefix}/num_horizons": float(num_horizons),
         f"{prefix}/mmd_bandwidth": float(bandwidth),
+        f"{prefix}/sinkhorn_epsilon": float(sinkhorn_eps),
     }
     for idx, row in enumerate(values):
         for name, value in zip(METRIC_NAMES, row):

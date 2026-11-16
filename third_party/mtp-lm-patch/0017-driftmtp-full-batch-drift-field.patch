@@ -1,0 +1,469 @@
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index bef2f9c..b38833b 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -8,6 +8,7 @@ import sys
+ import math
+ import pprint
+ import time
++from collections import deque
+ from dataclasses import asdict
+ from datetime import timedelta
+ from functools import partial
+@@ -1250,6 +1251,19 @@ def fit(
+     running_drift_loss = None
+     # None unless drift_freeze_field_scale (state entry created in setup, see above).
+     drift_scale_state = state.get("drift_field_scale")
++    # Full-batch drift field (claudefullbatchdriftplan.md): with n_accum > 1 or world_size > 1
++    # the field's population is the whole global batch (all micro-batches of the optimizer
++    # step on every rank), not one micro-batch. There is no switch for this. Ranks are pooled
++    # by one all_gather of the detached states (gather_drift_population). drift_two_pass: the
++    # drift term carries gradient and n_accum > 1, so a no-grad pass 1 over the step's
++    # micro-batches computes the field first and pass 2 runs the usual per-micro-batch
++    # forward + backward. drift_log_only: drift_weight 0, so the field is only logged, from
++    # states cached during the normal single pass. Otherwise (n_accum == 1, world_size > 1)
++    # a pooled single pass: the field comes from the live micro-batch and the other ranks'.
++    n_accum = train.gradient_accumulation_iters(devices, num_nodes)
++    drift_full_batch = False
++    drift_two_pass = False
++    drift_log_only = False
+     if drift_enabled:
+         assert not hparams.singleshot.gt_teacher_supervision, (
+             "singleshot.drift_enabled requires the student-forced teacher pass, which "
+@@ -1268,9 +1282,37 @@ def fit(
+             sys.path.insert(0, _driftmtp_src_dir)
+         from driftmtp.training import DriftAccumulationTracker
+         from driftmtp.training import compute_drift_loss as compute_drift_loss_fn
++        from driftmtp.training import compute_population_drift_field as compute_population_drift_field_fn
++        from driftmtp.training import drift_population_mode
++        from driftmtp.training import drift_surrogate_loss as drift_surrogate_loss_fn
++        from driftmtp.training import gather_drift_population as gather_drift_population_fn
++        from driftmtp.features import extract_predictive_states as extract_predictive_states_fn
++        drift_mode = drift_population_mode(
++            drift_enabled, hparams.singleshot.drift_weight, n_accum, fabric.world_size
++        )
++        drift_full_batch, drift_two_pass, drift_log_only = (
++            drift_mode.full_batch, drift_mode.two_pass, drift_mode.log_only
++        )
++        drift_population_desc = f"{n_accum} micro-batches x {fabric.world_size} ranks"
++        if drift_two_pass:
++            # Pass 2 reuses only pass 1's hard teacher labels (no second teacher forward), and
++            # does not keep the teacher logits that extra_train_metrics needs.
++            if not hparams.singleshot.hard_teacher_supervision:
++                raise ValueError("The full-batch drift field (drift_weight != 0, n_accum > 1) needs "
++                                 "hard_teacher_supervision=True.")
++            if hparams.singleshot.extra_train_metrics:
++                raise ValueError("extra_train_metrics is not supported with the full-batch drift "
++                                 "field (drift_weight != 0, n_accum > 1).")
++            fabric.print(f"Drift field: global batch ({drift_population_desc}), two-pass.")
++        elif drift_log_only:
++            fabric.print(f"Drift field: global batch ({drift_population_desc}), logged only (drift_weight=0).")
++        elif drift_full_batch:
++            fabric.print(f"Drift field: global batch ({drift_population_desc}), pooled single pass.")
++        # The full-batch field is computed once per optimizer step, so the tracker holds that
++        # one observation (its std/ratio are then degenerate); otherwise one per micro-step.
+         drift_accum_tracker = DriftAccumulationTracker(
+             temperatures=hparams.singleshot.drift_temperatures,
+-            window=train.gradient_accumulation_iters(devices, num_nodes),
++            window=1 if drift_full_batch else train.gradient_accumulation_iters(devices, num_nodes),
+         )
+         running_drift_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+ 
+@@ -1348,47 +1390,10 @@ def fit(
+         fabric.print("WARNING: drift_freeze_field_scale with no LR warmup: each horizon's field "
+                      "scale is frozen at its first observation, i.e. from a single batch.")
+ 
+-    for train_data in train_iterator:
+-        if state["iter_num"] >= max_iters:
+-            break
+-
+-        iter_t0 = time.perf_counter()
+-
+-        # determine and set the learning rate for this iteration
+-        lr = get_lr(hparams.train.lr_schedule, optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, train.min_lr)
+-        for param_group in optimizer.param_groups:
+-            param_group["lr"] = lr
+-
+-        state["iter_num"] += 1
+-
+-        # DriftMTP Phase 2 (diagnostic-only): only compute/request hidden states on iterations
+-        # that will actually be logged, so a disabled (or between-log) step pays zero extra cost.
+-        # Requires the student-forced teacher pass, so it is inapplicable under
+-        # gt_teacher_supervision (which skips that pass entirely). Independent of drift_enabled:
+-        # diagnostics can run with drift training off (compute_training_diagnostics_fn is only
+-        # non-None when drift_diagnostics_enabled resolved the hook above).
+-        run_drift_diagnostics = (
+-            (compute_training_diagnostics_fn is not None)
+-            and (state["iter_num"] % log_iter_interval == 0)
+-            and (not hparams.singleshot.gt_teacher_supervision)
+-        )
+-        drift_diagnostics = {}
+-
+-        run_geometry_diag = (
+-            compute_geometry_diag_fn is not None
+-            and state["iter_num"] % geometry_iter_interval == 0
+-        )
+-        geometry_diagnostics = {}
+-
+-        # DriftMTP Phase 4 (training): unlike run_drift_diagnostics above, this must be True on
+-        # EVERY iteration drift training is enabled (L_drift needs to backprop every step, not
+-        # just on logged iterations). Hidden states are requested whenever either consumer needs
+-        # them: drift_enabled (every step) or run_drift_diagnostics (logged steps only, when
+-        # diagnostics are on but drift training is off). gt_teacher_supervision is already
+-        # asserted against at hook-resolution time for the drift-loss path.
+-        need_hidden_states = drift_enabled or smoothl1_enabled or run_drift_diagnostics or run_geometry_diag
+-
+-        data_mask_prep_t0 = time.perf_counter()
++    def _prepare_microbatch(train_data):
++        """Data / mask prep of one micro-batch: k_toks, rolling offset, block masks of both
++        models, truncate_and_mask. Deterministic given state["step_count"], so the two-pass
++        drift path (claudefullbatchdriftplan.md) can rerun it for pass 1 and get the same masks."""
+         train_data_len = train_data.shape[1] - 1
+         input_ids = train_data[:, 0 : train_data_len].contiguous().long()
+         target_ids = train_data[:, 1 : (train_data_len + 1)].contiguous().long()
+@@ -1524,6 +1529,180 @@ def fit(
+                 f"This might be because of offset rollover that cuts off some mask regions."
+             )
+ 
++        return (input_ids, target_ids, mask_id_mask, pred_pos_mask, prefix_pos_mask, orig_input_ids,
++                k_toks, data_bsz, tot_mask_regions, rolling_offset, truncation_length, mask_region_ct,
++                tot_nonpad_tokens)
++
++    # Two-pass full-batch drift (claudefullbatchdriftplan.md section 5). Pass 1 takes the rest
++    # of the step's micro-batches from train_iterator into two_pass_buffer; the loop then reads
++    # them from there for pass 2, so iter_num, logging, timing and checkpoints keep their cadence.
++    two_pass_buffer = deque()
++
++    def _train_batches():
++        while True:
++            yield two_pass_buffer.popleft() if two_pass_buffer else next(train_iterator)
++
++    def _global_batch_drift_field(x, y):
++        """The drift field over the global batch, from this rank's detached step states
++        (R, k, d_h) pooled with every other rank's (collective when world_size > 1). One
++        field-scale observation and one tracker update per optimizer step, on the
++        population's horizons (identical on every rank)."""
++        population = gather_drift_population_fn(fabric.all_gather, fabric.global_rank, fabric.world_size, x, y)
++        field = compute_population_drift_field_fn(
++            population,
++            temperatures=hparams.singleshot.drift_temperatures,
++            eta=hparams.singleshot.drift_step_size,
++            use_column_norm=hparams.singleshot.drift_use_column_norm,
++            exclude_self_positive=hparams.singleshot.drift_exclude_self_positive,
++            tie_self_negative=hparams.singleshot.drift_tie_self_negative,
++            field_scales=None if drift_scale_state is None else drift_scale_state.divisors(population.k),
++        )
++        del population
++        if drift_scale_state is not None:
++            drift_scale_state.observe(field.per_horizon_results, len(field.per_horizon_results))
++        drift_accum_tracker.update(field.per_horizon_results, len(field.per_horizon_results))
++        return field
++
++    @torch.no_grad()
++    def _drift_pass1(first_train_data):
++        """Pass 1, at the first micro-iteration of an optimizer step: no-grad student and
++        teacher forwards over every micro-batch of the step, then one drift field over all
++        their rows. Caches per micro-batch only what pass 2 needs (the hard teacher labels and
++        the logging values computed from the teacher logits); activations are freed at once.
++        Returns (per-micro-batch list, FullBatchDriftField, x_all, y_all)."""
++        # A run that stops mid-step (max_iters) never takes that step's optimizer step.
++        n_micro = min(n_accum, max_iters - state["iter_num"] + 1)
++        batches = [first_train_data] + [next(train_iterator) for _ in range(n_micro - 1)]
++        two_pass_buffer.extend(batches[1:])
++        # Same freeze point as the single-pass path: the step's first micro-iteration.
++        if drift_scale_state is not None and not drift_scale_state.frozen and state["iter_num"] - 1 >= warmup_iters:
++            drift_scale_state.freeze(fabric)
++        micro, xs, ys, row_start = [], [], [], 0
++        for m, data in enumerate(batches):
++            (input_ids, _, mask_id_mask, pred_pos_mask, _, _, k_toks, _, tot_mask_regions,
++             _, _, _, _) = _prepare_microbatch(data)
++            logits, student_hidden = model(input_ids, return_hidden_states=True)
++            soft_stud_preds = logits[pred_pos_mask].view(tot_mask_regions, k_toks, -1)
++            if hparams.singleshot.sample_during_train:
++                bsz, num_pos, vocab = soft_stud_preds.shape
++                hard_stud_preds = torch.multinomial(F.softmax(soft_stud_preds, dim=-1).reshape(-1, vocab), num_samples=1).reshape(bsz, k_toks)
++            else:
++                hard_stud_preds = torch.argmax(soft_stud_preds, dim=-1)
++            stud_forcing_input_ids = input_ids.clone()
++            if k_toks - 1 > 0:
++                stud_forcing_input_ids[mask_id_mask] = hard_stud_preds[:, :(k_toks - 1)].reshape(-1)
++            logits_teacher, teacher_hidden = model_teacher(stud_forcing_input_ids, return_hidden_states=True)
++            soft_teach_preds = logits_teacher[pred_pos_mask].view(tot_mask_regions, k_toks, -1)
++            entry = {
++                "rows": slice(row_start, row_start + tot_mask_regions),
++                "hard_teach_preds": torch.argmax(soft_teach_preds, dim=-1),
++                "kl_teach_stud": soft_kl_teach_stud(soft_stud_preds, soft_teach_preds),
++                "drift_diagnostics": {},
++                "geometry_diagnostics": {},
++            }
++            # The diagnostics need the teacher pass, so they are computed here for the
++            # micro-iteration that will log them, exactly as the single pass would.
++            iter_num_m = state["iter_num"] + m
++            if compute_training_diagnostics_fn is not None and iter_num_m % log_iter_interval == 0:
++                entry["drift_diagnostics"] = compute_training_diagnostics_fn(
++                    student_hidden_full=student_hidden,
++                    teacher_hidden_full=teacher_hidden,
++                    student_logits_full=soft_stud_preds,
++                    hard_teacher_labels_full=entry["hard_teach_preds"],
++                    pred_pos_mask=pred_pos_mask,
++                    tot_mask_regions=tot_mask_regions,
++                    k_toks=k_toks,
++                    bandwidth_schedule=mmd_bandwidth_schedule,
++                    step=state["step_count"],
++                )
++            if compute_geometry_diag_fn is not None and iter_num_m % geometry_iter_interval == 0:
++                geometry_diag_t0 = time.perf_counter()
++                entry["geometry_diagnostics"] = compute_geometry_diag_fn(
++                    student_hidden_full=student_hidden,
++                    teacher_hidden_full=teacher_hidden,
++                    pred_pos_mask=pred_pos_mask,
++                    tot_mask_regions=tot_mask_regions,
++                    k_toks=k_toks,
++                    bandwidth_schedule=geometry_bandwidth_schedule,
++                    step=state["step_count"],
++                    gather_fn=geometry_gather_fn,
++                )
++                entry["geometry_diagnostics"]["diag/time_s"] = time.perf_counter() - geometry_diag_t0
++            xs.append(extract_predictive_states_fn(student_hidden, pred_pos_mask, tot_mask_regions, k_toks))
++            ys.append(extract_predictive_states_fn(teacher_hidden, pred_pos_mask, tot_mask_regions, k_toks))
++            micro.append(entry)
++            row_start += tot_mask_regions
++            del logits, student_hidden, logits_teacher, teacher_hidden, soft_stud_preds, soft_teach_preds
++        x_all, y_all = torch.cat(xs), torch.cat(ys)
++        del xs, ys
++        # One observation per optimizer step (the EMA time constant is now 10 steps).
++        field = _global_batch_drift_field(x_all, y_all)
++        return micro, field, x_all, y_all
++
++    # Log-only full-batch field (drift_weight == 0): detached (x_m, y_m) of each micro-batch,
++    # turned into one field after the step's last backward.
++    drift_log_cache = []
++    two_pass_micro, full_batch_field, two_pass_x_all, two_pass_y_all = None, None, None, None
++    drift_field_time = 0.0
++    drift_pass_consistency = None
++
++    for train_data in (_train_batches() if drift_two_pass else train_iterator):
++        if state["iter_num"] >= max_iters:
++            break
++
++        iter_t0 = time.perf_counter()
++
++        # determine and set the learning rate for this iteration
++        lr = get_lr(hparams.train.lr_schedule, optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, train.min_lr)
++        for param_group in optimizer.param_groups:
++            param_group["lr"] = lr
++
++        state["iter_num"] += 1
++
++        # DriftMTP Phase 2 (diagnostic-only): only compute/request hidden states on iterations
++        # that will actually be logged, so a disabled (or between-log) step pays zero extra cost.
++        # Requires the student-forced teacher pass, so it is inapplicable under
++        # gt_teacher_supervision (which skips that pass entirely). Independent of drift_enabled:
++        # diagnostics can run with drift training off (compute_training_diagnostics_fn is only
++        # non-None when drift_diagnostics_enabled resolved the hook above).
++        run_drift_diagnostics = (
++            (compute_training_diagnostics_fn is not None)
++            and (state["iter_num"] % log_iter_interval == 0)
++            and (not hparams.singleshot.gt_teacher_supervision)
++        )
++        drift_diagnostics = {}
++
++        run_geometry_diag = (
++            compute_geometry_diag_fn is not None
++            and state["iter_num"] % geometry_iter_interval == 0
++        )
++        geometry_diagnostics = {}
++
++        # DriftMTP Phase 4 (training): unlike run_drift_diagnostics above, this must be True on
++        # EVERY iteration drift training is enabled (L_drift needs to backprop every step, not
++        # just on logged iterations). Hidden states are requested whenever either consumer needs
++        # them: drift_enabled (every step) or run_drift_diagnostics (logged steps only, when
++        # diagnostics are on but drift training is off). gt_teacher_supervision is already
++        # asserted against at hook-resolution time for the drift-loss path.
++        need_hidden_states = drift_enabled or smoothl1_enabled or run_drift_diagnostics or run_geometry_diag
++
++        # Two-pass full-batch drift: pass 1 at the step's first micro-iteration, before this
++        # micro-batch's own prep (pass 1 leaves the block masks of the step's last micro-batch).
++        # Every micro-iteration is then pass 2 for its micro-batch, two_pass_mb.
++        if drift_two_pass:
++            if (state["iter_num"] - 1) % n_accum == 0:
++                drift_pass1_t0 = time.perf_counter()
++                # Free the previous step's cache before pass 1 builds the next one.
++                two_pass_micro = full_batch_field = two_pass_x_all = two_pass_y_all = two_pass_mb = None
++                two_pass_micro, full_batch_field, two_pass_x_all, two_pass_y_all = _drift_pass1(train_data)
++                drift_field_time = time.perf_counter() - drift_pass1_t0
++            two_pass_mb = two_pass_micro[(state["iter_num"] - 1) % n_accum]
++
++        data_mask_prep_t0 = time.perf_counter()
++        (input_ids, target_ids, mask_id_mask, pred_pos_mask, prefix_pos_mask, orig_input_ids,
++         k_toks, data_bsz, tot_mask_regions, rolling_offset, truncation_length, mask_region_ct,
++         tot_nonpad_tokens) = _prepare_microbatch(train_data)
++
+         new_settings_hash = hashlib.shake_128(str(model.block_mask_config).encode()).hexdigest(8)
+         
+         if hparams.singleshot.log_masks_and_inputs and (new_settings_hash not in model.old_settings_hashset):
+@@ -1603,7 +1782,20 @@ def fit(
+             # note: considered omitting ctx mgr as teach req's grads == False and used ~1gb more mem
+             # but reinstated while debugging speed issues with multi-region
+ 
+-            if not hparams.singleshot.gt_teacher_supervision:
++            if drift_two_pass:
++                # Pass 2: no teacher forward. The teacher ran in pass 1 on the same weights and
++                # inputs; its hard labels (all hard_teacher_supervision needs) and the logging
++                # values it fed were cached there.
++                hard_teach_preds = two_pass_mb["hard_teach_preds"]
++                assert hard_teach_preds.shape == (tot_mask_regions, k_toks), (
++                    f"pass 1 / pass 2 prep mismatch: {tuple(hard_teach_preds.shape)} vs {(tot_mask_regions, k_toks)}"
++                )
++                soft_teach_preds, teacher_hidden = None, None
++                if run_drift_diagnostics:
++                    drift_diagnostics = two_pass_mb["drift_diagnostics"]
++                if run_geometry_diag:
++                    geometry_diagnostics = two_pass_mb["geometry_diagnostics"]
++            elif not hparams.singleshot.gt_teacher_supervision:
+                 with torch.no_grad():
+                     teacher_fwd_out = model_teacher(
+                         stud_forcing_input_ids, return_hidden_states=need_hidden_states
+@@ -1767,7 +1959,51 @@ def fit(
+             # time_iter_total), so the check would have nothing to read.
+             drift_loss_t0 = time.perf_counter()
+             drift_loss = torch.tensor(0.0, device=fabric.device)
+-            if drift_enabled:
++            if drift_two_pass:
++                # Pass 2: D_m, this micro-batch's rows against the full-batch field from pass 1.
++                # Divided by n_accum with the MTP loss below, like the single pass.
++                x_live = extract_predictive_states_fn(student_hidden, pred_pos_mask, tot_mask_regions, k_toks)
++                drift_loss = drift_surrogate_loss_fn(
++                    x_live,
++                    full_batch_field.V[two_pass_mb["rows"]],
++                    full_batch_field.S_j,
++                    eta=hparams.singleshot.drift_step_size,
++                )
++                # Self-check on logged iterations: pass 2's states should equal pass 1's up to
++                # bf16 noise (same weights and inputs).
++                if state["iter_num"] % log_iter_interval == 0:
++                    with torch.no_grad():
++                        x_pass1 = two_pass_x_all[two_pass_mb["rows"]].float()
++                        drift_pass_consistency = (
++                            (x_live.detach().float() - x_pass1).abs().max() / x_pass1.pow(2).mean().sqrt().clamp_min(1e-12)
++                        ).item()
++                total_loss = loss + hparams.singleshot.drift_weight * drift_loss
++            elif drift_log_only:
++                # drift_weight == 0: no drift gradient. Keep the detached states; the full-batch
++                # field is computed for logging after the step's last backward.
++                drift_log_cache.append((
++                    extract_predictive_states_fn(student_hidden, pred_pos_mask, tot_mask_regions, k_toks).detach(),
++                    extract_predictive_states_fn(teacher_hidden, pred_pos_mask, tot_mask_regions, k_toks).detach(),
++                ))
++                total_loss = loss
++            elif drift_full_batch:
++                # Pooled single pass (n_accum == 1, world_size > 1): this micro-batch is the
++                # rank's whole step and its graph is alive, so the global-batch field needs only
++                # the other ranks' detached states, and D_m is backpropagated directly.
++                drift_field_t0 = time.perf_counter()
++                if drift_scale_state is not None and not drift_scale_state.frozen and state["iter_num"] - 1 >= warmup_iters:
++                    drift_scale_state.freeze(fabric)
++                x_live = extract_predictive_states_fn(student_hidden, pred_pos_mask, tot_mask_regions, k_toks)
++                full_batch_field = _global_batch_drift_field(
++                    x_live.detach(),
++                    extract_predictive_states_fn(teacher_hidden, pred_pos_mask, tot_mask_regions, k_toks).detach(),
++                )
++                drift_field_time = time.perf_counter() - drift_field_t0
++                drift_loss = drift_surrogate_loss_fn(
++                    x_live, full_batch_field.V, full_batch_field.S_j, eta=hparams.singleshot.drift_step_size
++                )
++                total_loss = loss + hparams.singleshot.drift_weight * drift_loss
++            elif drift_enabled:
+                 # Frozen field scale (claudetiedselfnegplan.md): live lambda_{tau,j} during LR
+                 # warmup (divisors all NaN), frozen EMA afterwards. Same freeze point as beta.
+                 field_scales = None
+@@ -1811,13 +2047,19 @@ def fit(
+             if smoothl1_enabled:
+                 if not smoothl1_beta_state.frozen and state["iter_num"] - 1 >= warmup_iters:
+                     smoothl1_beta_state.freeze(fabric)
+-                sl1_x, sl1_y = extract_smoothl1_pair_fn(
+-                    student_hidden_full=student_hidden,
+-                    teacher_hidden_full=teacher_hidden,
+-                    pred_pos_mask=pred_pos_mask,
+-                    tot_mask_regions=tot_mask_regions,
+-                    k_toks=k_toks,
+-                )
++                if drift_two_pass:
++                    # Pass 2 has no teacher forward: the teacher states are pass 1's (the same
++                    # slice extract_smoothl1_pair takes).
++                    sl1_x = extract_predictive_states_fn(student_hidden, pred_pos_mask, tot_mask_regions, k_toks).float()
++                    sl1_y = two_pass_y_all[two_pass_mb["rows"]].float()
++                else:
++                    sl1_x, sl1_y = extract_smoothl1_pair_fn(
++                        student_hidden_full=student_hidden,
++                        teacher_hidden_full=teacher_hidden,
++                        pred_pos_mask=pred_pos_mask,
++                        tot_mask_regions=tot_mask_regions,
++                        k_toks=k_toks,
++                    )
+                 smoothl1_beta_state.observe(
+                     (sl1_x.detach() - sl1_y).abs(), k_toks, hparams.singleshot.smoothl1_beta_quantile
+                 )
+@@ -1834,10 +2076,26 @@ def fit(
+         post_bwd_t0 = time.perf_counter()
+         loss_rank0 = loss.detach()
+         running_loss.update(loss_rank0)
+-        if drift_enabled:
++        if drift_enabled and not drift_log_only:
+             running_drift_loss.update(drift_loss.detach())
+         if smoothl1_enabled:
+             running_smoothl1_loss.update(smoothl1_loss.detach())
++        # Log-only full-batch field (drift_weight == 0): one field from the step's cached states
++        # after its last backward. running_drift_loss gets each micro-batch's D_m, the same
++        # mean-of-means the two-pass path backpropagates.
++        if drift_log_only and not is_accumulating:
++            drift_field_t0 = time.perf_counter()
++            if drift_scale_state is not None and not drift_scale_state.frozen and state["iter_num"] - n_accum >= warmup_iters:
++                drift_scale_state.freeze(fabric)
++            log_x_all = torch.cat([x for x, _ in drift_log_cache])
++            log_y_all = torch.cat([y for _, y in drift_log_cache])
++            log_row_counts = [x.shape[0] for x, _ in drift_log_cache]
++            drift_log_cache.clear()
++            full_batch_field = _global_batch_drift_field(log_x_all, log_y_all)
++            del log_x_all, log_y_all
++            for row_loss_m in full_batch_field.row_loss.split(log_row_counts):
++                running_drift_loss.update(row_loss_m.mean())
++            drift_field_time = time.perf_counter() - drift_field_t0
+ 
+         running_ce_teach_stud.update(ce_teach_stud.detach())
+         # kl_teach_stud is always logged as the soft KL(p_teach || p_stud) over every predicted
+@@ -1846,7 +2104,10 @@ def fit(
+         # hard_self_teacher_supervision. Computed after backward so it adds nothing to peak memory.
+         # gt_teacher_supervision skips the teacher pass, so there are no teacher logits and the
+         # loss's value (CE against the ground truth) is logged unchanged.
+-        if not hparams.singleshot.gt_teacher_supervision:
++        if drift_two_pass:
++            # From pass 1's logits (pass 2 keeps no teacher logits).
++            kl_teach_stud = two_pass_mb["kl_teach_stud"]
++        elif not hparams.singleshot.gt_teacher_supervision:
+             kl_teach_stud = soft_kl_teach_stud(soft_stud_preds, soft_teach_preds)
+         running_kl_teach_stud.update(kl_teach_stud.detach())
+         running_ent_teach.update(ent_teach.detach())
+@@ -2047,7 +2308,22 @@ def fit(
+                     # L_MTP is falling faster than the drift term is fading.
+                     "drift/aux_native_loss_ratio": weighted_drift_loss / (abs(native_mtp_loss) + 1e-8),
+                     "drift/tie_self_negative": float(hparams.singleshot.drift_tie_self_negative),
++                    # claudefullbatchdriftplan.md: which population / path this run uses.
++                    "drift/two_pass_enabled": float(drift_two_pass),
++                    "drift/full_batch_field": float(drift_full_batch),
+                 }
++                if drift_full_batch:
++                    drift_metrics.update({
++                        # Rows of the field's population (every rank), and the loss with every
++                        # row weighted equally (drift/loss is the mean over micro-batches of D_m).
++                        "drift/full_batch_rows": full_batch_field.population_rows,
++                        "drift/loss_full_batch": full_batch_field.loss.item(),
++                        # Pass 1 (two-pass) or the log-only field computation, this step.
++                        "drift/time_field_s": drift_field_time,
++                    })
++                if drift_two_pass and drift_pass_consistency is not None:
++                    # max |x_pass2 - x_pass1| / rms(x_pass1): should be bf16 noise only.
++                    drift_metrics["drift/pass_consistency_relmax"] = drift_pass_consistency
+                 drift_metrics.update(drift_accum_tracker.compute(prefix="drift"))
+                 if drift_scale_state is not None:
+                     drift_metrics.update(drift_scale_state.metrics(prefix="drift"))

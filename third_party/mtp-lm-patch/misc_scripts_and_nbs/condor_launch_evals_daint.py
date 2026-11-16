@@ -71,6 +71,10 @@ CR_DOCUMENTS_PATH = None
 CR_DOCUMENTS_SAMPLE = None
 CR_DOCUMENTS_SEED = None
 CR_MMD_BANDWIDTH = None
+# Fixed Sinkhorn eps, Euclidean-distance units. None = not passed, so sinkhorn_epsilon in
+# --default-mtp-cfg decides; --cr-sinkhorn-epsilon none = 1.0 * std of each checkpoint's
+# horizon-1 D_ST. REMINDER: like CR_MMD_BANDWIDTH, 1B and 8B need their own value.
+CR_SINKHORN_EPSILON = None
 # Training's pqds.prelude_token_ids. None = not passed, so condrollouteval's default
 # (the 1B marker 128009-128006-882-128007) applies. The 8B Magpie data has no system
 # header, so that marker never matches there: pass 128006-882-128007 for 8B runs.
@@ -137,6 +141,9 @@ parser.add_argument("--cr-documents-seed", type=int, default=CR_DOCUMENTS_SEED,
 parser.add_argument("--cr-mmd-bandwidth", default=CR_MMD_BANDWIDTH,
                     help="fixed MMD bandwidth, squared-distance units; 'none' = median heuristic "
                          "per checkpoint (default: mmd_bandwidth in --default-mtp-cfg)")
+parser.add_argument("--cr-sinkhorn-epsilon", default=CR_SINKHORN_EPSILON,
+                    help="fixed Sinkhorn eps, Euclidean-distance units; 'none' = 1.0 * std of "
+                         "horizon-1 D_ST per checkpoint (default: sinkhorn_epsilon in --default-mtp-cfg)")
 parser.add_argument("--cr-prelude-token-ids", default=CR_PRELUDE_TOKEN_IDS,
                     help="training's pqds.prelude_token_ids, '-'-separated, e.g. 128006-882-128007 "
                          "for the 8B Magpie data (default: condrollouteval's 1B marker)")
@@ -190,6 +197,7 @@ CR_DOCUMENTS_PATH = args.cr_documents_path
 CR_DOCUMENTS_SAMPLE = args.cr_documents_sample
 CR_DOCUMENTS_SEED = args.cr_documents_seed
 CR_MMD_BANDWIDTH = args.cr_mmd_bandwidth
+CR_SINKHORN_EPSILON = args.cr_sinkhorn_epsilon
 CR_PRELUDE_TOKEN_IDS = args.cr_prelude_token_ids
 REQUIREMENTS = args.requirements
 CR_ONLY = args.controlled_rollout_only
@@ -319,6 +327,8 @@ if CONTROLLED_ROLLOUT:
         _cr_optional += f" \\\n    --documents-seed {CR_DOCUMENTS_SEED}"
     if CR_MMD_BANDWIDTH is not None:
         _cr_optional += f" \\\n    --mmd-bandwidth {CR_MMD_BANDWIDTH}"
+    if CR_SINKHORN_EPSILON is not None:
+        _cr_optional += f" \\\n    --sinkhorn-epsilon {CR_SINKHORN_EPSILON}"
     if CR_PRELUDE_TOKEN_IDS is not None:
         _cr_optional += f" \\\n    --prelude-token-ids {CR_PRELUDE_TOKEN_IDS}"
     CONTROLLED_ROLLOUT_BLOCK = f"""

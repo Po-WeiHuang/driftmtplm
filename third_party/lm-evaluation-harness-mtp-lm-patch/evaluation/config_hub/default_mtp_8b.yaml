@@ -1,0 +1,80 @@
+# 8B (Llama-3.1-8B-Magpie) variant of default_mtp.yaml: identical except the
+# controlled-rollout documents and the fixed MMD bandwidth / Sinkhorn eps, which
+# are on the 8B hidden-state scale. Keep every 8B eval on these values so MMD,
+# Sinkhorn and the energy distance compare directly across 8B runs.
+model: hf
+model_args:
+  pretrained: 
+  dtype: float32
+
+trust_remote_code: true
+
+gen_kwargs:
+  do_sample: false
+  until:
+  - </s>
+  - <|end_of_text|>
+  - <|eot_id|>
+  - <|endoftext|>
+  - <|im_end|>
+  do_mtp: true
+  k_toks: 1
+  strategy: null
+  mask_id: 128259
+  eos_id:
+  - 128009
+  - 128001
+  include_prompt: true
+  return_mtp_result_dict: true
+
+batch_size: 1
+
+# Few-shot controls for the free-rollout pipeline.
+#   enable_fewshot: false  -> zero-shot; num_fewshot is ignored and warned about once.
+#   num_fewshot: N         -> exactly N demonstrations. This overrides the task
+#                             YAML's own count for every task run with this config;
+#                             set it to null to keep each task's default instead.
+# 8 is gsm8k_cot_singleshot's shipped count, so these values reproduce the
+# free-rollout behaviour this config had before the flag existed.
+enable_fewshot: false
+num_fewshot: 0
+
+output_path: ./outputs/lm_eval
+log_samples: true
+
+# Controlled-rollout diagnostic (python -m driftmtp.eval.condrollouteval).
+# Must sit under `metadata`: lm_eval rejects unknown top-level keys. The launcher
+# (condor_launch_evals_daint.py) passes --enabled, the checkpoints, k_toks and
+# strategy itself; CLI flags override anything set here.
+metadata:
+  controlled_rollout:
+    # Documents (question + answer) per student/teacher forward pass. Speed and
+    # GPU memory only; the metrics do not depend on it.
+    micro_batch_size: 32
+    # ECE / confidence-band bin count (Guo et al. 2017 convention).
+    n_bins: 15
+    # A confidence band reports acc_stud_gt / acc_stud_teach only if it holds at
+    # least this many tokens; below it only the count `n` is written. 220 keeps
+    # the worst-case 95% error bar (+-0.98/sqrt(n)) at +-0.066, inside one of the
+    # 15 ECE bands (1/15 = 0.067). null -> derive from n_bins (217 at 15 bins).
+    # See docs/eval_pipeline/confband_accuracy.md.
+    min_band_samples: 220
+    # Documents the controlled rollout scores: training's own held-out val split
+    # (processed, `input_ids` column, used exactly as training tokenized it) rather
+    # than the free-rollout task's test set, so calibration is measured on the
+    # training distribution. A raw split with a templated `text` column also works.
+    # null -> the lm_eval task's own documents. CLI --documents-path overrides this;
+    # --documents-path none forces the task's documents.
+    documents_path: /data/snoplus/weiiiiiii/aiproj/driftmtplm/dataset/train/outputs/l3_magpie_metamath/processed/val
+    # Seeded random subset of the 31,548 val sequences; keep the seed fixed so every
+    # checkpoint scores the same sequences. null -> all of them.
+    documents_sample: 4000
+    documents_seed: 0
+    # Fixed MMD kernel bandwidth (squared-distance units, ignite's `var`), so MMD is
+    # on one scale across 8B checkpoints. 1B uses 16000 (default_mtp.yaml).
+    mmd_bandwidth: 35000
+    # Fixed Sinkhorn entropic eps (Euclidean-distance units; ground cost is the raw
+    # Euclidean D_ST), so Sinkhorn and the debiased sinkhorn_divergence are on one
+    # scale across 8B checkpoints: the frozen diag/sinkhorn_epsilon of the 8B
+    # fullbatch_lockstep run (W&B nxkr7l92). The energy distance needs no parameter.
+    sinkhorn_epsilon: 28.27
