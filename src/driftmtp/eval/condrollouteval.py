@@ -1230,6 +1230,7 @@ def per_horizon_records(
     min_latent_samples: int = 200,
     thin_bin_below: int = 30,
     mmd_bandwidth: Optional[float] = None,
+    sinkhorn_epsilon: Optional[float] = None,
 ):
     """One record per horizon, plus the MMD bandwidth they all share.
 
@@ -1243,7 +1244,10 @@ def per_horizon_records(
     | `mean_joint_confidence` | `C_{:,j}.mean()` — where this horizon's joint population actually sits |
     | `n_samples_joint` | regions selected *through* depth `j` |
     | `ece_*` / `ece_joint_*` | `bins_populated`, `max_bin_weight`, `min_bin_count`, `thin_bin_share` — occupancy of the binning each ECE above just did |
-    | `mmd` / `sinkhorn` | full-population, one shared bandwidth |
+    | `mmd` / `sinkhorn` | full-population, one shared bandwidth / one shared eps |
+    | `sinkhorn_divergence` | debiased `OT_eps(S,T) - OT_eps(S,S)/2 - OT_eps(T,T)/2` (Feydy et al. 2019 eq. 3), same eps; eval-only |
+    | `energy_distance` / `energy_distance_normalized` | pairing-free energy distance, and the same divided by mean D_TT |
+    | `sinkhorn_epsilon` | the eps `sinkhorn` used, identical on every horizon |
 
     **Bandwidth.** One `MMDBandwidthSchedule(warmup_steps=1)`, updated once
     from horizon 1's features and frozen for every horizon after — so every
@@ -1258,6 +1262,14 @@ def per_horizon_records(
     kernels (14.7k-19.7k across the NewNewLlama 1B runs) and their MMDs are not
     on one scale; a fixed bandwidth makes MMD comparable across checkpoints.
 
+    **Sinkhorn eps and the energy distance.** Both come from one set of
+    distance matrices per horizon (`_latent_distance_metrics`), so D_ST is
+    built once and shared. `sinkhorn_epsilon=None` derives eps from horizon
+    1's D_ST (`metrics.sinkhorn.sinkhorn_epsilon_from_cost`, the training
+    diagnostics' rule) and reuses it for every horizon; a fixed value, like a
+    fixed `mmd_bandwidth`, puts every checkpoint on one scale. The energy
+    distance needs no parameter.
+
     Horizons with no selected samples are **omitted**, never emitted as `0.0`
     or `NaN`.
 
@@ -1266,8 +1278,8 @@ def per_horizon_records(
     than emitted and caveated. `n_samples` / `n_samples_joint` are always
     written, so a reader can see *why* a horizon carries no metric.
 
-    `min_latent_samples=200` gates `mmd` and `sinkhorn` together — they are
-    computed from the same `(x, y)`, so splitting the floor would report them
+    `min_latent_samples=200` gates `mmd`, `sinkhorn` and the energy distance
+    together — they are computed from the same `(x, y)`, so splitting the floor would report them
     on different populations. The binding constraint is MMD: the unbiased
     U-statistic goes negative on thin draws and `sqrt(clamp(·, min=0))` floors
     it, so a missing measurement reads as a *perfect* student/teacher match.
@@ -1302,8 +1314,7 @@ def per_horizon_records(
         (or `None` if no horizon had samples).
     """
     from ..metrics.calibration import ece_bin_stats, ece_from_pairs
-    from ..metrics.mmd import MMDBandwidthSchedule, maximum_mean_discrepancy
-    from ..metrics.sinkhorn import sinkhorn_distance
+    from ..metrics.mmd import MMDBandwidthSchedule
 
     k_toks = pooled["confidence"].shape[1]
     generator = torch.Generator().manual_seed(seed)
@@ -1316,6 +1327,8 @@ def per_horizon_records(
         bandwidth = torch.tensor(float(mmd_bandwidth))
     elif x1.shape[0] > 0:
         bandwidth = MMDBandwidthSchedule(warmup_steps=1).update(0, x1, y1)
+    if sinkhorn_epsilon is not None and not sinkhorn_epsilon > 0:
+        raise ValueError(f"sinkhorn_epsilon must be positive, got {sinkhorn_epsilon}")
 
     records = []
     for j in range(1, k_toks + 1):
@@ -1366,11 +1379,70 @@ def per_horizon_records(
             # aggregate_horizons weights by this, so a capped run weights
             # every horizon equally rather than by a count it never used.
             record["n_latent_samples"] = int(x.shape[0])
-            record["mmd"] = float(maximum_mean_discrepancy(x, y, bandwidth=bandwidth))
-            record["sinkhorn"] = float(sinkhorn_distance(x, y))
+            latent, sinkhorn_epsilon = _latent_distance_metrics(x, y, sinkhorn_epsilon, bandwidth)
+            record.update(latent)
         records.append(record)
 
     return records, (float(bandwidth) if bandwidth is not None else None)
+
+
+@torch.no_grad()
+def _latent_distance_metrics(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sinkhorn_epsilon: Optional[float],
+    bandwidth: Optional[torch.Tensor] = None,
+) -> Tuple[Dict[str, float], float]:
+    """MMD, Sinkhorn, the debiased Sinkhorn divergence and the energy distance for
+    one horizon's paired `(n, d_h)` states, all from ONE set of distance matrices.
+
+    D_SS, D_TT, D_ST come from `geometry.pairwise_distance_matrices` -- the same
+    centered-cdist definition the training diagnostics log -- built once and
+    passed to every metric:
+
+    | Matrix | Used by |
+    |---|---|
+    | D_ST | Sinkhorn's ground cost, the divergence's cross term, the energy distance's cross term, MMD's XY (squared) |
+    | D_SS / D_TT | the divergence's self-terms, the energy distance's within-population means, MMD's XX / YY (squared) |
+
+    `x`, `y` are float32 here, so MMD from the squared matrices matches
+    ignite's own Gram-matrix MMD to rounding (training's bf16 matrices are too
+    coarse for that; see `metrics.mmd.mmd_from_sq_dists`). `bandwidth=None`
+    skips MMD. With `sinkhorn_epsilon=None`, eps is derived from this D_ST and
+    returned so the caller can reuse it for every later horizon; the divergence
+    uses the same eps for all three OT terms.
+    """
+    from ..geometry import GEOMETRY_EPS, energy_distance_from_means, pairwise_distance_matrices
+    from ..metrics.mmd import mmd_from_sq_dists
+    from ..metrics.sinkhorn import (
+        entropic_ot_from_cost,
+        sinkhorn_and_entropic_ot_from_cost,
+        sinkhorn_divergence_from_ot,
+        sinkhorn_epsilon_from_cost,
+    )
+
+    n = x.shape[0]
+    d_ss, d_tt, d_st = pairwise_distance_matrices(x, y)
+    if sinkhorn_epsilon is None:
+        sinkhorn_epsilon = float(sinkhorn_epsilon_from_cost(d_st))
+    # One solve on D_ST gives both the raw cost and the divergence's cross term.
+    sinkhorn, ot_st = sinkhorn_and_entropic_ot_from_cost(d_st, epsilon=sinkhorn_epsilon)
+    ot_ss = entropic_ot_from_cost(d_ss, epsilon=sinkhorn_epsilon)
+    ot_tt = entropic_ot_from_cost(d_tt, epsilon=sinkhorn_epsilon)
+    d_ss_mean = d_ss.sum() / (n * (n - 1))  # zero diagonal, so this is the off-diagonal mean
+    d_tt_mean = d_tt.sum() / (n * (n - 1))
+    energy = energy_distance_from_means(d_st.mean(), d_st.diagonal().mean(), d_ss_mean, d_tt_mean, n)
+    out = {}
+    if bandwidth is not None:
+        out["mmd"] = float(mmd_from_sq_dists(d_ss.square(), d_tt.square(), d_st.square(), bandwidth))
+    out.update({
+        "sinkhorn": float(sinkhorn),
+        "sinkhorn_divergence": float(sinkhorn_divergence_from_ot(ot_st, ot_ss, ot_tt)),
+        "sinkhorn_epsilon": float(sinkhorn_epsilon),
+        "energy_distance": float(energy),
+        "energy_distance_normalized": float(energy / (d_tt_mean + GEOMETRY_EPS)),
+    })
+    return out, sinkhorn_epsilon
 
 
 @torch.no_grad()
@@ -1379,7 +1451,7 @@ def aggregate_horizons(records: List[Dict], pooled: Dict[str, torch.Tensor]) -> 
 
     | Key | Definition |
     |---|---|
-    | `mmd/mean`, `sinkhorn/mean` | mean over horizons that have the metric, **weighted by `n_latent_samples`** |
+    | `mmd/mean`, `sinkhorn/mean`, `sinkhorn_divergence/mean`, `energy_distance/mean`, `energy_distance_normalized/mean` | mean over horizons that have the metric, **weighted by `n_latent_samples`** |
     | `ece_stud_gt_joint`, `ece_stud_teach_joint` | the **deepest** horizon's joint ECE — the whole-block number, restated where a sweep can find it |
     | `avg_effective_k` | mean of `effective_k` over the regions that actually ran — those with `effective_k > 0` |
 
@@ -1437,7 +1509,7 @@ def aggregate_horizons(records: List[Dict], pooled: Dict[str, torch.Tensor]) -> 
     the summary; its last element is the headline.
     """
     out: Dict[str, float] = {}
-    for key in ("mmd", "sinkhorn"):
+    for key in ("mmd", "sinkhorn", "sinkhorn_divergence", "energy_distance", "energy_distance_normalized"):
         pairs = [(r[key], r["n_latent_samples"]) for r in records if key in r]
         total = sum(n for _, n in pairs)
         if total:
@@ -1591,6 +1663,7 @@ def build_results_payload(
     mmd_bandwidth: Optional[float],
     student_checkpoint: str,
     teacher_checkpoint: str,
+    sinkhorn_epsilon: Optional[float] = None,
     confband: Optional[Dict[str, Dict]] = None,
     min_band_samples: Optional[int] = None,
     prelude_token_ids: Optional[Sequence[int]] = None,
@@ -1625,6 +1698,7 @@ def build_results_payload(
         "max_pool_samples": max_pool_samples,
         "seed": seed,
         "mmd_bandwidth": mmd_bandwidth,
+        "sinkhorn_epsilon": sinkhorn_epsilon,
         "student_checkpoint": str(student_checkpoint),
         "teacher_checkpoint": str(teacher_checkpoint),
         "per_horizon": records,
@@ -1730,6 +1804,7 @@ def run_controlled_rollout(
     prelude_token_ids: Optional[Sequence[int]] = LLAMA3_USER_HEADER_PRELUDE,
     prompt_formatter: Optional[Callable[[str], str]] = None,
     mmd_bandwidth: Optional[float] = None,
+    sinkhorn_epsilon: Optional[float] = None,
 ) -> Dict:
     """The whole diagnostic: documents in, results payload out.
 
@@ -1785,7 +1860,10 @@ def run_controlled_rollout(
         min_ece_samples=min_ece_samples,
         min_latent_samples=min_latent_samples,
         mmd_bandwidth=mmd_bandwidth,
+        sinkhorn_epsilon=sinkhorn_epsilon,
     )
+    # The eps every horizon's Sinkhorn used: the fixed value, or the one derived from horizon 1.
+    sinkhorn_epsilon = next((r["sinkhorn_epsilon"] for r in records if "sinkhorn_epsilon" in r), None)
     aggregate = aggregate_horizons(records, pooled)
     if min_band_samples is None:
         min_band_samples = min_band_samples_for(n_bins)
@@ -1804,6 +1882,7 @@ def run_controlled_rollout(
         max_pool_samples=max_pool_samples,
         seed=seed,
         mmd_bandwidth=bandwidth,
+        sinkhorn_epsilon=sinkhorn_epsilon,
         student_checkpoint=student_checkpoint,
         teacher_checkpoint=teacher_checkpoint,
         confband=confband,
@@ -1876,6 +1955,9 @@ _CONFIG_DEFAULTS: Dict[str, object] = {
     # Fixed MMD kernel bandwidth (squared-distance units). None -> median heuristic
     # on each checkpoint's own horizon-1 features, which differs per checkpoint.
     "mmd_bandwidth": None,
+    # Fixed Sinkhorn eps (Euclidean-distance units). None -> 1.0 * std of each
+    # checkpoint's own horizon-1 D_ST, which differs per checkpoint.
+    "sinkhorn_epsilon": None,
 }
 
 
@@ -1969,6 +2051,12 @@ def resolve_config(yaml_block: Optional[Dict] = None, cli_overrides: Optional[Di
         config["mmd_bandwidth"] = float(config["mmd_bandwidth"])
         if not config["mmd_bandwidth"] > 0:
             raise ValueError(f"mmd_bandwidth must be positive, got {config['mmd_bandwidth']}")
+    if config["sinkhorn_epsilon"] in ("", "none", "None"):
+        config["sinkhorn_epsilon"] = None
+    if config["sinkhorn_epsilon"] is not None:
+        config["sinkhorn_epsilon"] = float(config["sinkhorn_epsilon"])
+        if not config["sinkhorn_epsilon"] > 0:
+            raise ValueError(f"sinkhorn_epsilon must be positive, got {config['sinkhorn_epsilon']}")
     config["prelude_token_ids"] = (
         parse_prelude_token_ids(config["prelude_token_ids"]) if config["mask_prelude"] else None
     )
@@ -2020,6 +2108,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--mmd-bandwidth", "--mmd_bandwidth", dest="mmd_bandwidth",
                         help="fixed MMD kernel bandwidth, squared-distance units (e.g. 16000); "
                              "'none' = median heuristic per checkpoint")
+    parser.add_argument("--sinkhorn-epsilon", "--sinkhorn_epsilon", dest="sinkhorn_epsilon",
+                        help="fixed Sinkhorn entropic eps, Euclidean-distance units; "
+                             "'none' = 1.0 * std of horizon-1 D_ST per checkpoint")
     parser.add_argument("--out-dir", "--out_dir", dest="out_dir",
                         help="the SAME directory lm_eval wrote results_*.json into")
     parser.add_argument("--k-toks", "--k_toks", dest="k_toks", type=int,
@@ -2145,9 +2236,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         prelude_token_ids=config["prelude_token_ids"],
         prompt_formatter=prompt_formatter,
         mmd_bandwidth=config["mmd_bandwidth"],
+        sinkhorn_epsilon=config["sinkhorn_epsilon"],
     )
     payload["document_source"] = document_source
     payload["mmd_bandwidth_source"] = "fixed" if config["mmd_bandwidth"] is not None else "median_heuristic_h1"
+    payload["sinkhorn_epsilon_source"] = "fixed" if config["sinkhorn_epsilon"] is not None else "d_st_std_h1"
     path = write_results(payload, config["out_dir"])
     print(f"wrote {path}")
     print(f"  chat template: {payload['chat_template']}, prelude masking: {payload['prelude_token_ids']} "
@@ -2156,7 +2249,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  h{record['horizon']}: n={record['n_samples']} "
               f"ece_gt={record.get('ece_stud_gt', float('nan')):.4f} "
               f"mmd={record.get('mmd', float('nan')):.4f} "
-              f"sinkhorn={record.get('sinkhorn', float('nan')):.3f}")
+              f"sinkhorn={record.get('sinkhorn', float('nan')):.3f} "
+              f"sinkhorn_div={record.get('sinkhorn_divergence', float('nan')):.3f} "
+              f"energy_norm={record.get('energy_distance_normalized', float('nan')):.4f}")
     bands = payload["confband"]
     print(f"  confband: {sum('acc_stud_gt' in b for b in bands.values())}/{len(bands)} "
           f"non-empty bands reported (min_band_samples={payload['min_band_samples']})")

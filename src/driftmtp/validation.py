@@ -14,15 +14,19 @@ training step already computes exactly that pattern every iteration, so
 tapping it directly needs no second forward pass and no second dataloader.
 """
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
-from .features import anchor_horizons, extract_predictive_states
-from .geometry import pairwise_distance_matrices
+from .features import anchor_horizons
+from .geometry import DiagnosticDistances, diagnostic_distances
 from .metrics.calibration import expected_calibration_error
-from .metrics.mmd import MMDBandwidthSchedule, paired_maximum_mean_discrepancy
-from .metrics.sinkhorn import sinkhorn_distance
+from .metrics.mmd import MMDBandwidthSchedule, mmd_from_sq_dists
+from .metrics.sinkhorn import sinkhorn_from_cost
+
+# drift_diag/sinkhorn keeps sinkhorn_distance's original fixed eps (its default), unlike
+# diag/sinkhorn's frozen scale-relative eps.
+DRIFT_DIAG_SINKHORN_EPSILON = 0.1
 
 
 @torch.no_grad()
@@ -37,6 +41,7 @@ def compute_training_diagnostics(
     bandwidth_schedule: MMDBandwidthSchedule,
     step: int,
     prefix: str = "drift_diag",
+    distances: Optional[DiagnosticDistances] = None,
 ) -> Dict[str, float]:
     """Diagnostic ECE/MMD/Sinkhorn at the anchor horizon set for one training step.
 
@@ -66,6 +71,10 @@ def compute_training_diagnostics(
             `bandwidth_schedule`.
         prefix: metric key prefix (default `"drift_diag"`), kept separate
             from the training-loss metrics namespace.
+        distances: this micro-iteration's rank-local
+            `geometry.diagnostic_distances(...)` (no gather), shared with the
+            `diag/` hook so D_SS / D_TT / D_ST are built once per step; None
+            builds them here, once per horizon.
 
     Returns:
         Flat `{str: float}` dict, safe to `.update()` into the existing
@@ -73,12 +82,16 @@ def compute_training_diagnostics(
         is a detached Python float — no tensors, no autograd references are
         retained by the return value.
     """
-    x = extract_predictive_states(
-        student_hidden_full, pred_pos_mask, tot_mask_regions, k_toks
-    ).detach()
-    y_pos = extract_predictive_states(
-        teacher_hidden_full, pred_pos_mask, tot_mask_regions, k_toks
-    ).detach()
+    if distances is None:
+        distances = diagnostic_distances(
+            student_hidden_full, teacher_hidden_full, pred_pos_mask, tot_mask_regions, k_toks
+        )
+    if distances is None or distances.s.shape[0] != tot_mask_regions:
+        n = None if distances is None else distances.s.shape[0]
+        raise ValueError(
+            f"drift_diag needs this rank's {tot_mask_regions} regions (>= 2), got {n}: "
+            "were `distances` built with a cross-rank gather_fn?"
+        )
 
     horizons = anchor_horizons(k_toks)
 
@@ -92,17 +105,15 @@ def compute_training_diagnostics(
     # MMD: ignite's estimator with the paired (s_i, t_i) kernels added back, shared with
     # diag/ (docs/geometry_diagnostics_report.md); plain ignite logged ~0 on most steps. The
     # bandwidth comes from horizon 1 (always the first anchor) and is reused for every anchor.
-    d_ss, d_tt, d_st = pairwise_distance_matrices(x[:, 0], y_pos[:, 0])
-    bandwidth = bandwidth_schedule.update_from_sq_dists(
-        step, d_ss.float().square(), d_tt.float().square(), d_st.float().square()
-    )
-    del d_ss, d_tt, d_st
+    # MMD, the bandwidth and Sinkhorn all take the shared float32 matrices as arguments.
+    d_ss, d_tt, d_st = distances.matrices[0]
+    bandwidth = bandwidth_schedule.update_from_sq_dists(step, d_ss.square(), d_tt.square(), d_st.square())
     for j in horizons:
-        out[f"{prefix}/mmd/h{j}"] = paired_maximum_mean_discrepancy(
-            x[:, j - 1], y_pos[:, j - 1], bandwidth
+        d_ss, d_tt, d_st = distances.matrices[j - 1]
+        out[f"{prefix}/mmd/h{j}"] = mmd_from_sq_dists(
+            d_ss.square(), d_tt.square(), d_st.square(), bandwidth, paired=True
         ).item()
-        # Sinkhorn unchanged: raw states, cost = cdist in their own dtype.
-        out[f"{prefix}/sinkhorn/h{j}"] = sinkhorn_distance(x[:, j - 1], y_pos[:, j - 1]).item()
+        out[f"{prefix}/sinkhorn/h{j}"] = sinkhorn_from_cost(d_st, epsilon=DRIFT_DIAG_SINKHORN_EPSILON).item()
     out[f"{prefix}/mmd_bandwidth"] = float(bandwidth)
 
     return out

@@ -186,6 +186,47 @@ def paired_maximum_mean_discrepancy(
 
 
 @torch.no_grad()
+def mmd_from_sq_dists(
+    d2_xx: torch.Tensor,
+    d2_yy: torch.Tensor,
+    d2_xy: torch.Tensor,
+    bandwidth: torch.Tensor,
+    paired: bool = False,
+) -> torch.Tensor:
+    """`maximum_mean_discrepancy` (or, `paired=True`, `paired_maximum_mean_discrepancy`)
+    from precomputed (n, n) squared-distance matrices.
+
+    ignite 0.5.5's estimator term for term: `k = exp(-0.5 d^2 / var)`, XX and YY over the
+    i != j pairs (`(sum - n) / (n (n - 1))`, which needs the d2_xx / d2_yy diagonals to be
+    zero, as `geometry.pairwise_distance_matrices` sets them), XY over all n^2 pairs, and
+    `sqrt(clamp(MMD^2, 0))`. `paired=True` takes the n paired kernels `k(x_i, y_i)` -- the
+    d2_xy diagonal -- back out of XY, Gretton et al. 2012 Lemma 6, as
+    `paired_maximum_mean_discrepancy` does. Lets a caller that already holds D_SS / D_TT /
+    D_ST reuse them instead of ignite rebuilding three Gram matrices.
+
+    Float32 matrices only: ignite forms its distances in float32, while bf16 distance
+    matrices round each entry by ~0.4%, which swamps a small MMD^2 -- 70-100% error at
+    MMD ~ 0.03 on 8B-like states.
+    """
+    n = d2_xx.shape[0]
+    if d2_xx.shape != (n, n) or d2_yy.shape != (n, n) or d2_xy.shape != (n, n):
+        raise ValueError(
+            f"need matching (n, n) matrices; got {tuple(d2_xx.shape)}, {tuple(d2_yy.shape)}, {tuple(d2_xy.shape)}"
+        )
+    if n < 2:
+        raise ValueError("need at least 2 samples")
+    var = float(bandwidth)
+    xx = (torch.exp(-0.5 * d2_xx / var).sum() - n) / (n * (n - 1))
+    yy = (torch.exp(-0.5 * d2_yy / var).sum() - n) / (n * (n - 1))
+    k_xy = torch.exp(-0.5 * d2_xy / var)
+    if paired:
+        xy = (k_xy.sum() - k_xy.diagonal().sum()) / (n * (n - 1))
+    else:
+        xy = k_xy.sum() / (n * n)
+    return (xx + yy - 2.0 * xy).clamp_min(0.0).sqrt()
+
+
+@torch.no_grad()
 def maximum_mean_discrepancy(
     x: torch.Tensor,
     y: torch.Tensor,

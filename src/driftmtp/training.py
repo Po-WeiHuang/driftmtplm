@@ -55,12 +55,12 @@ Implements `claudedriftingplan.md`'s PHASE 4 -- Training Integration:
 
 import math
 from collections import deque
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 
-from .drifting import DEFAULT_TEMPERATURES, DriftFieldResult, token_drifting_loss
+from .drifting import DEFAULT_TEMPERATURES, DriftFieldResult, token_drift_field, token_drifting_loss
 from .features import anchor_horizons, extract_predictive_states
 
 
@@ -119,6 +119,266 @@ def compute_drift_loss(
         field_scales=field_scales,
     )
     return DriftLossResult(loss=loss, per_horizon_results=per_horizon_results)
+
+
+# ---------------------------------------------------------------------------
+# Full-batch drift field (claudefullbatchdriftplan.md): the field's population is the
+# whole optimizer step (all gradient-accumulation micro-batches of every rank), not one
+# micro-batch. V, S_j and lambda_{tau,j} are stop-gradient, so the full-batch drift
+# gradient splits exactly by row: each micro-batch only needs its own rows of the
+# full-batch V. Other ranks' rows enter only through V, so pooling ranks needs one
+# all_gather of the detached states and no cross-rank backward.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DriftPopulationMode:
+    full_batch: bool  # field estimated on the whole global batch (every micro-batch of every rank)
+    two_pass: bool  # no-grad pass 1 needed: the drift term carries gradient and n_accum > 1
+    log_only: bool  # full-batch field logged only (drift_weight == 0), no drift gradient
+
+
+def drift_population_mode(
+    drift_enabled: bool, drift_weight: float, n_accum: int, world_size: int
+) -> DriftPopulationMode:
+    """claudefullbatchdriftplan.md section 4. The population is the global batch, with no
+    switch. Two passes are needed only when the drift term has a gradient and the step
+    spans more than one micro-batch per rank; every other loss is separable per row and
+    keeps the single pass. Ranks need no extra pass: with n_accum == 1 the micro-batch's
+    graph is still alive when the other ranks' states arrive (pooled single pass).
+    drift_weight == 0 needs no pass 1: the field is only logged, from the detached states
+    cached during the normal pass."""
+    if not drift_enabled:
+        return DriftPopulationMode(full_batch=False, two_pass=False, log_only=False)
+    full_batch = n_accum > 1 or world_size > 1
+    return DriftPopulationMode(
+        full_batch=full_batch,
+        two_pass=n_accum > 1 and drift_weight != 0.0,
+        log_only=full_batch and drift_weight == 0.0,
+    )
+
+
+@dataclass
+class DriftPopulation:
+    """The drift field's population: the step's predictive states of every rank (the
+    global batch). Horizon j holds the rows of every rank whose k_toks > j, in rank order
+    (k_toks differs across ranks under rand_rank_k_toks), with x and y rows paired. One
+    rank's population is just its own states."""
+
+    xs: List[torch.Tensor]  # per horizon j: (P_j, d_h) student states
+    ys: List[torch.Tensor]  # per horizon j: (P_j, d_h) teacher states
+    rank_rows: List[int]  # R_w, rows of each rank
+    rank_k: List[int]  # k_toks of each rank
+    rank: int  # this rank
+
+    @classmethod
+    def from_ranks(
+        cls, x_ranks: List[torch.Tensor], y_ranks: List[torch.Tensor], rank: int
+    ) -> "DriftPopulation":
+        """x_ranks, y_ranks: per rank, its (R_w, k_w, d_h) states."""
+        for x, y in zip(x_ranks, y_ranks):
+            if x.dim() != 3 or y.shape != x.shape:
+                raise ValueError(
+                    f"x and y must both be (R, k_toks, d_h) and match; got "
+                    f"{tuple(x.shape)} vs {tuple(y.shape)}"
+                )
+
+        def pool(states: List[torch.Tensor], j: int) -> torch.Tensor:
+            parts = [s[:, j] for s in states if s.shape[1] > j]
+            return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+        k = max(x.shape[1] for x in x_ranks)
+        return cls(
+            xs=[pool(x_ranks, j) for j in range(k)],
+            ys=[pool(y_ranks, j) for j in range(k)],
+            rank_rows=[x.shape[0] for x in x_ranks],
+            rank_k=[x.shape[1] for x in x_ranks],
+            rank=rank,
+        )
+
+    @property
+    def k(self) -> int:
+        """Horizons in the population: max k_toks over ranks."""
+        return len(self.xs)
+
+    def rows(self, w: int, j: int) -> slice:
+        """Rank w's rows inside horizon j (for j < rank_k[w])."""
+        start = sum(r for r, k in zip(self.rank_rows[:w], self.rank_k[:w]) if k > j)
+        return slice(start, start + self.rank_rows[w])
+
+
+@torch.no_grad()
+def gather_drift_population(
+    all_gather: Callable[[torch.Tensor], torch.Tensor],
+    rank: int,
+    world_size: int,
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> DriftPopulation:
+    """Pool this rank's (R, k, d_h) step states with every other rank's.
+
+    `all_gather` maps a tensor to its (world_size, ...) stack (`fabric.all_gather`). R and
+    k_toks may differ across ranks, so ranks first exchange (R, k), pad to (max R, max k)
+    for the one gather, and strip the padding (as `geometry.gather_predictive_states`, but
+    keeping every horizon). Collective when world_size > 1: every rank must call this on
+    the same iteration. world_size == 1 needs no communication.
+    """
+    if x.dim() != 3 or y.shape != x.shape:
+        raise ValueError(
+            f"x and y must both be (R, k_toks, d_h) and match; got {tuple(x.shape)} vs {tuple(y.shape)}"
+        )
+    if world_size == 1:
+        return DriftPopulation.from_ranks([x], [y], rank=0)
+    r, k = x.shape[0], x.shape[1]
+    meta = all_gather(torch.tensor([r, k], device=x.device, dtype=torch.long))
+    rank_rows, rank_k = meta[:, 0].tolist(), meta[:, 1].tolist()
+    pair = x.new_zeros((2, max(rank_rows), max(rank_k), x.shape[2]))
+    pair[0, :r, :k] = x
+    pair[1, :r, :k] = y
+    gathered = all_gather(pair)  # (world_size, 2, max R, max k, d_h)
+    shapes = list(zip(rank_rows, rank_k))
+    return DriftPopulation.from_ranks(
+        [gathered[w, 0, :rw, :kw] for w, (rw, kw) in enumerate(shapes)],
+        [gathered[w, 1, :rw, :kw] for w, (rw, kw) in enumerate(shapes)],
+        rank=rank,
+    )
+
+
+@dataclass
+class FullBatchDriftField:
+    V: torch.Tensor  # (R, k, d_h) fp32, detached: V_multi of this rank's rows and horizons
+    S_j: torch.Tensor  # (k,) fp32, detached (fp64 for fp64 inputs, here and in V)
+    row_loss: torch.Tensor  # (R,) mean_j mean_d (eta V)^2: each of this rank's rows' drift loss
+    per_horizon_results: List[DriftFieldResult]  # every population horizon; diagnostics only
+    population_row_loss: torch.Tensor  # (R_pop,) the same for every row of every rank
+
+    @property
+    def loss(self) -> torch.Tensor:
+        """The full-batch drift loss, every row of the global batch weighted equally
+        (= token_drifting_loss on the whole batch when k_toks is the same on every rank)."""
+        return self.population_row_loss.mean()
+
+    @property
+    def population_rows(self) -> int:
+        return self.population_row_loss.numel()
+
+
+@torch.no_grad()
+def compute_population_drift_field(
+    population: DriftPopulation,
+    temperatures: Sequence[float] = DEFAULT_TEMPERATURES,
+    eta: float = 1.0,
+    use_column_norm: bool = True,
+    exclude_self_positive: bool = True,
+    tie_self_negative: bool = False,
+    field_scales: Optional[torch.Tensor] = None,
+) -> FullBatchDriftField:
+    """One drift field over the whole population (claudefullbatchdriftplan.md section 5,
+    "full-batch field"): `token_drift_field` per horizon, same arguments as
+    `token_drifting_loss`, computed in fp32 (the single-pass path uses the bf16 states as
+    they come). Every rank computes the same field and keeps its own rows of V.
+
+    field_scales: (population.k, n_tau), normally `DriftFieldScaleState.divisors(population.k)`.
+    """
+    k = population.k
+    if field_scales is not None and field_scales.shape != (k, len(temperatures)):
+        raise ValueError(
+            f"field_scales must have shape ({k}, {len(temperatures)}), got {tuple(field_scales.shape)}"
+        )
+    # fp32, or fp64 when the inputs already are (the unit tests).
+    dtype = torch.promote_types(population.xs[0].dtype, torch.float32)
+    rank = population.rank
+    k_local = population.rank_k[rank]
+    V, S, sq, results = [], [], [], []
+    for j in range(k):
+        result = token_drift_field(
+            population.xs[j].to(dtype),
+            population.ys[j].to(dtype),
+            temperatures=temperatures,
+            use_column_norm=use_column_norm,
+            exclude_self_positive=exclude_self_positive,
+            tie_self_negative=tie_self_negative,
+            field_scale=None if field_scales is None else field_scales[j],
+        )
+        if j < k_local:
+            V.append(result.V_multi[population.rows(rank, j)])
+        S.append(result.S_j)
+        sq.append((eta * result.V_multi).pow(2).mean(dim=-1))
+        # The loggers read only S_j, per_temperature and total_rms; dropping the (P_j, d_h)
+        # tensors keeps one copy of the field (V) alive instead of three.
+        results.append(replace(result, V_multi=None, x_normalized=None))
+    V = torch.stack(V, dim=1)
+    row_loss = (eta * V).pow(2).mean(dim=-1).mean(dim=-1)
+    # Each row averages its own rank's horizons, as that rank's D_m does.
+    population_row_loss = torch.cat([
+        torch.stack([sq[j][population.rows(w, j)] for j in range(k_w)], dim=1).mean(dim=-1)
+        for w, k_w in enumerate(population.rank_k)
+    ])
+    return FullBatchDriftField(
+        V=V,
+        S_j=torch.stack(S[:k_local]),
+        row_loss=row_loss,
+        per_horizon_results=results,
+        population_row_loss=population_row_loss,
+    )
+
+
+@torch.no_grad()
+def compute_full_batch_drift_field(
+    x_all: torch.Tensor,
+    y_all: torch.Tensor,
+    temperatures: Sequence[float] = DEFAULT_TEMPERATURES,
+    eta: float = 1.0,
+    use_column_norm: bool = True,
+    exclude_self_positive: bool = True,
+    tie_self_negative: bool = False,
+    field_scales: Optional[torch.Tensor] = None,
+) -> FullBatchDriftField:
+    """`compute_population_drift_field` over one rank's step.
+
+    x_all, y_all: (R_tot, k, d_h) detached student / teacher predictive states, the
+        concatenation of every micro-batch's `extract_predictive_states` output.
+    """
+    return compute_population_drift_field(
+        DriftPopulation.from_ranks([x_all], [y_all], rank=0),
+        temperatures=temperatures,
+        eta=eta,
+        use_column_norm=use_column_norm,
+        exclude_self_positive=exclude_self_positive,
+        tie_self_negative=tie_self_negative,
+        field_scales=field_scales,
+    )
+
+
+def drift_surrogate_loss(
+    x: torch.Tensor, V_rows: torch.Tensor, S_j: torch.Tensor, eta: float = 1.0
+) -> torch.Tensor:
+    """D_m of claudefullbatchdriftplan.md section 5, pass 2: the drift loss of one
+    micro-batch's rows against the full-batch field,
+
+        x_hat = x / S_j,  target = sg(x_hat) + eta * V_rows,
+        D_m = mean_j mean_r mean_d (x_hat - target)^2,
+
+    the same reduction as `token_drifting_loss`. Its value is eta^2 mean (V_rows)^2 and its
+    gradient is -2 eta V / (R_m k d_h S_j), exactly the full-batch field's, because the
+    target is built from this pass's own x_hat (any pass 1 / pass 2 numerical difference
+    does not enter). At least fp32 internally; the gradient flows back to `x` in its own
+    dtype.
+
+    x: (R_m, k, d_h) live student states (grad-carrying). V_rows: (R_m, k, d_h), this
+    micro-batch's rows of `FullBatchDriftField.V`. S_j: (k,).
+    """
+    if x.dim() != 3 or V_rows.shape != x.shape:
+        raise ValueError(
+            f"x and V_rows must both be (R, k_toks, d_h) and match; got "
+            f"{tuple(x.shape)} vs {tuple(V_rows.shape)}"
+        )
+    if S_j.shape != (x.shape[1],):
+        raise ValueError(f"S_j must have shape ({x.shape[1]},), got {tuple(S_j.shape)}")
+    dtype = torch.promote_types(x.dtype, torch.float32)
+    x_hat = x.to(dtype) / S_j.detach().to(dtype).view(1, -1, 1)
+    target = x_hat.detach() + eta * V_rows.detach().to(dtype)
+    return (x_hat - target).pow(2).mean(dim=-1).mean()
 
 
 def _mean_std_ratio(values: Sequence[float]) -> Dict[str, float]:
@@ -359,8 +619,10 @@ class DriftAccumulationTracker:
         return out
 
 
-# Warmup EMA decay for the frozen drift field scale, per micro-step; same time constant
-# (10 micro-steps) and rationale as SMOOTHL1_BETA_EMA_DECAY below.
+# Warmup EMA decay for the frozen drift field scale, per observation; same time constant
+# (10 observations) and rationale as SMOOTHL1_BETA_EMA_DECAY below. With the full-batch
+# field (claudefullbatchdriftplan.md) there is one observation per optimizer step, so
+# 10 optimizer steps; with n_accum == 1 the two coincide.
 DRIFT_FIELD_SCALE_EMA_DECAY = 0.9
 
 
