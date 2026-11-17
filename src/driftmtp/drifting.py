@@ -72,6 +72,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 
+from .horizon_weighting import horizon_weighted_sum
 from .normalization import (
     effective_temperature,
     feature_scale,
@@ -414,6 +415,7 @@ def token_drifting_loss(
     exclude_self_positive: bool = True,
     tie_self_negative: bool = False,
     field_scales: Optional[torch.Tensor] = None,
+    horizon_gamma: Optional[float] = None,
 ) -> Tuple[torch.Tensor, List[DriftFieldResult]]:
     """claudedriftingplan.md "Token Drifting Loss": stopped-target token
     drifting loss, mean-pooled over the feature dimension d_h and averaged
@@ -426,6 +428,9 @@ def token_drifting_loss(
     tie_self_negative: see the module docstring / `token_drift_field`.
     field_scales: optional (k_toks, n_tau) detached divisors; row j-1 goes to horizon j
         as `token_drift_field`'s `field_scale` (NaN = live lambda_tau).
+    horizon_gamma: None averages the per-horizon losses (the default); a float weights
+        horizon j by `horizon_weighting.horizon_weights` (proportional to gamma^(j-1))
+        instead. The field itself does not depend on it.
 
     Returns (loss, per_horizon_results): `loss` is a scalar tensor whose
     gradient reaches `x` only (teacher, negatives, S_j, lambda_{tau,j}, and
@@ -469,5 +474,8 @@ def token_drifting_loss(
         per_horizon_losses.append(loss_j)
         per_horizon_results.append(result)
 
-    loss = torch.stack(per_horizon_losses).mean()
+    if horizon_gamma is None:
+        loss = torch.stack(per_horizon_losses).mean()
+    else:
+        loss = horizon_weighted_sum(torch.stack(per_horizon_losses), horizon_gamma)
     return loss, per_horizon_results

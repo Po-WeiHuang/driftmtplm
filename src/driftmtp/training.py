@@ -62,6 +62,7 @@ import torch
 
 from .drifting import DEFAULT_TEMPERATURES, DriftFieldResult, token_drift_field, token_drifting_loss
 from .features import anchor_horizons, extract_predictive_states
+from .horizon_weighting import horizon_weighted_sum
 
 
 @dataclass
@@ -82,6 +83,7 @@ def compute_drift_loss(
     exclude_self_positive: bool = True,
     tie_self_negative: bool = False,
     field_scales: Optional[torch.Tensor] = None,
+    horizon_gamma: Optional[float] = None,
 ) -> DriftLossResult:
     """claudedriftingplan.md PHASE 4: `L_drift^token`, grad-carrying into the student.
 
@@ -99,7 +101,7 @@ def compute_drift_loss(
         `torch.no_grad()` forward pass. `token_drifting_loss` detaches it
         again internally regardless (belt-and-suspenders, per
         claudedriftingplan.md's "Teacher features ... MUST be detached").
-    tie_self_negative, field_scales: see `drifting.token_drifting_loss`;
+    tie_self_negative, field_scales, horizon_gamma: see `drifting.token_drifting_loss`;
         `field_scales` normally comes from `DriftFieldScaleState.divisors(k_toks)`.
     """
     x = extract_predictive_states(
@@ -117,6 +119,7 @@ def compute_drift_loss(
         exclude_self_positive=exclude_self_positive,
         tie_self_negative=tie_self_negative,
         field_scales=field_scales,
+        horizon_gamma=horizon_gamma,
     )
     return DriftLossResult(loss=loss, per_horizon_results=per_horizon_results)
 
@@ -248,7 +251,9 @@ def gather_drift_population(
 class FullBatchDriftField:
     V: torch.Tensor  # (R, k, d_h) fp32, detached: V_multi of this rank's rows and horizons
     S_j: torch.Tensor  # (k,) fp32, detached (fp64 for fp64 inputs, here and in V)
-    row_loss: torch.Tensor  # (R,) mean_j mean_d (eta V)^2: each of this rank's rows' drift loss
+    # (R,) mean_j mean_d (eta V)^2: each of this rank's rows' drift loss (sum_j w_j mean_d
+    # (eta V)^2 with horizon weights)
+    row_loss: torch.Tensor
     per_horizon_results: List[DriftFieldResult]  # every population horizon; diagnostics only
     population_row_loss: torch.Tensor  # (R_pop,) the same for every row of every rank
 
@@ -272,6 +277,7 @@ def compute_population_drift_field(
     exclude_self_positive: bool = True,
     tie_self_negative: bool = False,
     field_scales: Optional[torch.Tensor] = None,
+    horizon_gamma: Optional[float] = None,
 ) -> FullBatchDriftField:
     """One drift field over the whole population (claudefullbatchdriftplan.md section 5,
     "full-batch field"): `token_drift_field` per horizon, same arguments as
@@ -279,6 +285,9 @@ def compute_population_drift_field(
     they come). Every rank computes the same field and keeps its own rows of V.
 
     field_scales: (population.k, n_tau), normally `DriftFieldScaleState.divisors(population.k)`.
+    horizon_gamma: only changes the logged `row_loss` / `population_row_loss` (each row's
+        horizons get `horizon_weights` over that row's own rank's k_toks, as its D_m
+        does); V, S_j and the per-horizon results are the same with or without it.
     """
     k = population.k
     if field_scales is not None and field_scales.shape != (k, len(temperatures)):
@@ -308,10 +317,17 @@ def compute_population_drift_field(
         # tensors keeps one copy of the field (V) alive instead of three.
         results.append(replace(result, V_multi=None, x_normalized=None))
     V = torch.stack(V, dim=1)
-    row_loss = (eta * V).pow(2).mean(dim=-1).mean(dim=-1)
+
+    def over_horizons(per_horizon: torch.Tensor) -> torch.Tensor:
+        # (rows, k_w) -> (rows,): the reduction over horizons that D_m uses.
+        if horizon_gamma is None:
+            return per_horizon.mean(dim=-1)
+        return horizon_weighted_sum(per_horizon, horizon_gamma)
+
+    row_loss = over_horizons((eta * V).pow(2).mean(dim=-1))
     # Each row averages its own rank's horizons, as that rank's D_m does.
     population_row_loss = torch.cat([
-        torch.stack([sq[j][population.rows(w, j)] for j in range(k_w)], dim=1).mean(dim=-1)
+        over_horizons(torch.stack([sq[j][population.rows(w, j)] for j in range(k_w)], dim=1))
         for w, k_w in enumerate(population.rank_k)
     ])
     return FullBatchDriftField(
@@ -333,6 +349,7 @@ def compute_full_batch_drift_field(
     exclude_self_positive: bool = True,
     tie_self_negative: bool = False,
     field_scales: Optional[torch.Tensor] = None,
+    horizon_gamma: Optional[float] = None,
 ) -> FullBatchDriftField:
     """`compute_population_drift_field` over one rank's step.
 
@@ -347,11 +364,16 @@ def compute_full_batch_drift_field(
         exclude_self_positive=exclude_self_positive,
         tie_self_negative=tie_self_negative,
         field_scales=field_scales,
+        horizon_gamma=horizon_gamma,
     )
 
 
 def drift_surrogate_loss(
-    x: torch.Tensor, V_rows: torch.Tensor, S_j: torch.Tensor, eta: float = 1.0
+    x: torch.Tensor,
+    V_rows: torch.Tensor,
+    S_j: torch.Tensor,
+    eta: float = 1.0,
+    horizon_gamma: Optional[float] = None,
 ) -> torch.Tensor:
     """D_m of claudefullbatchdriftplan.md section 5, pass 2: the drift loss of one
     micro-batch's rows against the full-batch field,
@@ -364,6 +386,11 @@ def drift_surrogate_loss(
     target is built from this pass's own x_hat (any pass 1 / pass 2 numerical difference
     does not enter). At least fp32 internally; the gradient flows back to `x` in its own
     dtype.
+
+    With `horizon_gamma` (fixedkweightedplan_zh-TW.md) the mean over horizons becomes the
+    weighted sum D_m = sum_j w_j mean_r mean_d (x_hat - target)^2, with w_j from
+    `horizon_weights`, and the gradient of horizon j is -2 eta w_j V / (R_m d_h S_j):
+    k w_j times the unweighted one.
 
     x: (R_m, k, d_h) live student states (grad-carrying). V_rows: (R_m, k, d_h), this
     micro-batch's rows of `FullBatchDriftField.V`. S_j: (k,).
@@ -378,7 +405,9 @@ def drift_surrogate_loss(
     dtype = torch.promote_types(x.dtype, torch.float32)
     x_hat = x.to(dtype) / S_j.detach().to(dtype).view(1, -1, 1)
     target = x_hat.detach() + eta * V_rows.detach().to(dtype)
-    return (x_hat - target).pow(2).mean(dim=-1).mean()
+    if horizon_gamma is None:
+        return (x_hat - target).pow(2).mean(dim=-1).mean()
+    return horizon_weighted_sum((x_hat - target).pow(2).mean(dim=(0, 2)), horizon_gamma)
 
 
 def _mean_std_ratio(values: Sequence[float]) -> Dict[str, float]:
@@ -773,11 +802,17 @@ def extract_smoothl1_pair(
     return x, y
 
 
-def compute_smoothl1_loss(x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor) -> SmoothL1LossResult:
+def compute_smoothl1_loss(
+    x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor, horizon_gamma: Optional[float] = None
+) -> SmoothL1LossResult:
     """L_SL1 = mean_{r,j,d} SmoothL1_{beta_j}(x - sg(y)), with a separate beta_j per horizon.
 
     `F.smooth_l1_loss` only takes a scalar beta, hence the explicit `torch.where`.
     Mean over d_h, so the loss scale does not depend on model width.
+
+    With `horizon_gamma` (fixedkweightedplan_zh-TW.md) the loss is sum_j w_j mean_{r,d}
+    SmoothL1_{beta_j}, with w_j from `horizon_weights`. The per-horizon outputs stay
+    unweighted.
     """
     k_toks = x.shape[1]
     err = x - y.detach()
@@ -785,7 +820,10 @@ def compute_smoothl1_loss(x: torch.Tensor, y: torch.Tensor, beta: torch.Tensor) 
     abs_e = err.abs()
     is_l1 = abs_e >= b
     elem = torch.where(is_l1, abs_e - 0.5 * b, 0.5 * err.pow(2) / b)
-    loss = elem.mean()
+    if horizon_gamma is None:
+        loss = elem.mean()
+    else:
+        loss = horizon_weighted_sum(elem.mean(dim=(0, 2)), horizon_gamma)
     with torch.no_grad():
         return SmoothL1LossResult(
             loss=loss,

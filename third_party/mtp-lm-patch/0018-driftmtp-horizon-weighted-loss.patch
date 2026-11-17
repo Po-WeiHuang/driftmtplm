@@ -1,0 +1,227 @@
+diff --git a/litgpt/args.py b/litgpt/args.py
+index 8fc807d..5654394 100644
+--- a/litgpt/args.py
++++ b/litgpt/args.py
+@@ -465,6 +465,20 @@ class SingleShotArgs:
+     """Quantile q of |student - teacher| that sets beta_j per horizon. beta_j is an EMA of
+     it during LR warmup and frozen afterwards. Must be in (0, 1)."""
+ 
++    horizon_weight_enabled: bool = False
++    """Horizon-weighted training loss (fixedkweightedplan_zh-TW.md; src/driftmtp/horizon_weighting.py).
++    False (default): the MTP token loss, the drift loss and the Smooth-L1 loss are each mean-pooled
++    over all predicted positions, exactly as before, and horizon_loss_gamma is not read. True: each
++    of the three becomes sum_j w_j * l_j, where l_j is that loss averaged over the regions of
++    horizon j and w_j = gamma^(j-1) / sum_{i=1..k} gamma^(i-1) is normalised over the k_toks of the
++    current step (so it also works with random k). Not supported with hard_self_teacher_supervision."""
++
++    horizon_loss_gamma: float = 0.9
++    """gamma of horizon_weight_enabled, in (0, 1]; only read when that switch is True. 1.0 equals
++    mean pooling. The default 0.9 gives horizon 1 a weight of 15.4% at fixed k = 10, the closest to
++    the 15.9% it has under k ~ U[2,16] with mean pooling (fixedkweightedplan_zh-TW.md, table B).
++    0.8 is the value in EAGLE-3's training code."""
++
+ 
+ def parse_temp_sep_token_id_range(temp_sep_token_id_range: str):
+     """'128011-128255' -> (128011, 128255)"""
+diff --git a/litgpt/pretrain.py b/litgpt/pretrain.py
+index 1cf3ba4..1682ac3 100644
+--- a/litgpt/pretrain.py
++++ b/litgpt/pretrain.py
+@@ -71,29 +71,42 @@ from litgpt.utils import (
+ from litgpt.repetition_diversity_tokens import measure_repetition_and_diversity
+ 
+ 
+-def pt_ce_plus_ent_loss(logits_student=None, logits_teacher=None, labels_teacher=None, beta=None):
++def pt_ce_plus_ent_loss(logits_student=None, logits_teacher=None, labels_teacher=None, beta=None, horizon_weights=None):
+     # BxLxV, BxLxV
+     # kl isolating formula implemented using the available reference cross entropy function
+     # logic is structured to limit any extraneous computation
+ 
+     stud_logits = logits_student.flatten(end_dim=-2) # (BxL)xV
+ 
++    # Horizon-weighted loss (fixedkweightedplan_zh-TW.md). horizon_weights None: every term is
++    # mean-pooled over all BxL positions, as before. horizon_weights (L,), summing to 1: every
++    # term is sum_j w_j * (mean over the B regions of horizon j), in fp32. That needs
++    # logits_student as (B regions, L = k_toks horizons, V), which is what the train loop passes.
++    if horizon_weights is None:
++        def cross_entropy(logits, target):
++            return F.cross_entropy(logits, target, reduction="mean") # 1x
++    else:
++        def cross_entropy(logits, target):
++            per_pos = F.cross_entropy(logits, target, reduction="none").float() # (BxL)
++            per_horizon = per_pos.view(-1, horizon_weights.shape[0]).mean(dim=0) # L
++            return (per_horizon * horizon_weights.to(per_horizon)).sum() # 1x
++
+     if labels_teacher is not None:
+         ent_teach = torch.tensor(0.0) # ent_teach will be treated as 0 in this case, bc teach_labels is 1-hot.
+         teach_labels = labels_teacher.flatten() # (BxL)x1erges all dimensions up to the second-to-last one into one dimension.
+-        ce_teach_stud = F.cross_entropy(stud_logits, teach_labels, reduction="mean") # 1x
++        ce_teach_stud = cross_entropy(stud_logits, teach_labels)
+         kl_teach_stud = ce_teach_stud # ... - ent_teach but 0 in this case.
+     else:
+         teach_logits = logits_teacher.flatten(end_dim=-2) # (BxL)xV
+         teach_probs = F.softmax(teach_logits, -1)
+-        ent_teach = F.cross_entropy(teach_logits, teach_probs, reduction="mean") # 1x
+-        ce_teach_stud = F.cross_entropy(stud_logits, teach_probs, reduction="mean") # 1x
++        ent_teach = cross_entropy(teach_logits, teach_probs)
++        ce_teach_stud = cross_entropy(stud_logits, teach_probs)
+         kl_teach_stud = ce_teach_stud - ent_teach
+     
+     # we only need to do the student entropy calc if beta > 0
+     if beta > 0.0:
+         stud_probs = F.softmax(stud_logits, -1)
+-        ent_stud = F.cross_entropy(stud_logits, stud_probs, reduction="mean") # 1x
++        ent_stud = cross_entropy(stud_logits, stud_probs)
+     else:
+         ent_stud = torch.tensor(0.0) # ent_stud will be treated as 0 in this case.
+     
+@@ -501,6 +514,25 @@ def _validate_geometry_diag_flags(ss: SingleShotArgs, log_interval: int) -> None
+         raise ValueError(f"geometry_diag_mmd_warmup_steps must be >= 1, got {ss.geometry_diag_mmd_warmup_steps}.")
+ 
+ 
++def _validate_horizon_weight_flags(ss: SingleShotArgs) -> list:
++    """Reject invalid horizon-weighted-loss settings; return non-fatal warnings. Standalone
++    like `_validate_regulariser_flags`, so it can be tested without Fabric
++    (tests/test_driftmtp_horizon_weighting.py). See fixedkweightedplan_zh-TW.md and
++    src/driftmtp/horizon_weighting.py."""
++    if not ss.horizon_weight_enabled:
++        # gamma is not read with the switch off; a non-default value is most likely a
++        # forgotten switch.
++        if ss.horizon_loss_gamma != SingleShotArgs.horizon_loss_gamma:
++            return [f"horizon_loss_gamma={ss.horizon_loss_gamma} is ignored because horizon_weight_enabled=False."]
++        return []
++    if not 0.0 < ss.horizon_loss_gamma <= 1.0:
++        raise ValueError(f"horizon_loss_gamma must be in (0, 1], got {ss.horizon_loss_gamma}.")
++    if ss.hard_self_teacher_supervision:
++        raise ValueError("horizon_weight_enabled is not supported with hard_self_teacher_supervision: "
++                         "the matched positions it keeps are not the same number on every horizon.")
++    return []
++
++
+ def setup(
+     pdb: Optional[bool] = False,
+     model_name: Optional[str] = None,
+@@ -581,6 +613,7 @@ def setup(
+ 
+     # Before any model is built: validate the drift / Smooth-L1 regulariser settings.
+     regulariser_warnings = _validate_regulariser_flags(hparams.singleshot)
++    regulariser_warnings += _validate_horizon_weight_flags(hparams.singleshot)
+     _validate_geometry_diag_flags(hparams.singleshot, train.log_interval)
+     
+     # FIXME there should be a more elegant way to do this, but I couldnt figure out the
+@@ -1357,6 +1390,22 @@ def fit(
+         )
+         running_smoothl1_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+ 
++    # Horizon-weighted loss (fixedkweightedplan_zh-TW.md): one switch for the MTP token loss,
++    # the drift loss and the Smooth-L1 loss. horizon_gamma None (switch off) is mean pooling:
++    # every loss below then takes exactly its previous code path. With the switch on, each loss
++    # is sum_j w_j * (its mean over the regions of horizon j), with w_j proportional to
++    # gamma^(j-1) and normalised over the micro-batch's own k_toks, so random k needs nothing
++    # extra.
++    horizon_gamma = None
++    horizon_weights_fn = None
++    if hparams.singleshot.horizon_weight_enabled:
++        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
++        if _driftmtp_src_dir not in sys.path:
++            sys.path.insert(0, _driftmtp_src_dir)
++        from driftmtp.horizon_weighting import horizon_weights as horizon_weights_fn
++        horizon_gamma = hparams.singleshot.horizon_loss_gamma
++        fabric.print(f"Horizon-weighted loss: w_j proportional to {horizon_gamma}^(j-1) on the MTP, drift and Smooth-L1 losses.")
++
+     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+     running_grad_norm = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+ 
+@@ -1570,6 +1619,7 @@ def fit(
+             exclude_self_positive=hparams.singleshot.drift_exclude_self_positive,
+             tie_self_negative=hparams.singleshot.drift_tie_self_negative,
+             field_scales=None if drift_scale_state is None else drift_scale_state.divisors(population.k),
++            horizon_gamma=horizon_gamma,
+         )
+         del population
+         if drift_scale_state is not None:
+@@ -1952,10 +2002,13 @@ def fit(
+             # 3. full loss calculation based on stud preds and stud-forced teacher preds
+             # assert not (hparams.singleshot.hard_teacher_supervision and hparams.singleshot.gt_teacher_supervision), "One or the other."
+             assert sum([hparams.singleshot.hard_teacher_supervision, hparams.singleshot.gt_teacher_supervision, hparams.singleshot.hard_self_teacher_supervision]) <= 1, "Supervision styles are mutually exclusive, but more than one was selected."
++            # Horizon-weighted loss: the (k_toks,) weights of this micro-batch's k, or None for
++            # mean pooling. hard_self_teacher_supervision never gets them (rejected in setup).
++            mtp_horizon_weights = None if horizon_gamma is None else horizon_weights_fn(k_toks, horizon_gamma, device=fabric.device)
+             if hparams.singleshot.hard_teacher_supervision:
+-                loss_terms = pt_ce_plus_ent_loss(logits_student=soft_stud_preds, logits_teacher=soft_teach_preds, labels_teacher=hard_teach_preds, beta=hparams.singleshot.beta)
++                loss_terms = pt_ce_plus_ent_loss(logits_student=soft_stud_preds, logits_teacher=soft_teach_preds, labels_teacher=hard_teach_preds, beta=hparams.singleshot.beta, horizon_weights=mtp_horizon_weights)
+             elif hparams.singleshot.gt_teacher_supervision:
+-                loss_terms = pt_ce_plus_ent_loss(logits_student=soft_stud_preds, logits_teacher=None, labels_teacher=gt_suffix_ids, beta=hparams.singleshot.beta)
++                loss_terms = pt_ce_plus_ent_loss(logits_student=soft_stud_preds, logits_teacher=None, labels_teacher=gt_suffix_ids, beta=hparams.singleshot.beta, horizon_weights=mtp_horizon_weights)
+             elif hparams.singleshot.hard_self_teacher_supervision:
+                 # at the last second here, we isolate only the positions where the student's hard pred equals the teacher's hard pred, and only use those for supervision.
+                 match_mask = hard_stud_preds == hard_teach_preds
+@@ -1969,7 +2022,7 @@ def fit(
+                     continue
+                 loss_terms = pt_ce_plus_ent_loss(logits_student=masked_soft_stud_preds, logits_teacher=None, labels_teacher=masked_hard_stud_preds, beta=hparams.singleshot.beta)
+             else:
+-                loss_terms = pt_ce_plus_ent_loss(logits_student=soft_stud_preds, logits_teacher=soft_teach_preds, beta=hparams.singleshot.beta)
++                loss_terms = pt_ce_plus_ent_loss(logits_student=soft_stud_preds, logits_teacher=soft_teach_preds, beta=hparams.singleshot.beta, horizon_weights=mtp_horizon_weights)
+             loss, ce_teach_stud, kl_teach_stud, ent_teach, ent_stud = loss_terms
+             main_loss_t1 = time.perf_counter()
+             
+@@ -2012,6 +2065,7 @@ def fit(
+                     full_batch_field.V[two_pass_mb["rows"]],
+                     full_batch_field.S_j,
+                     eta=hparams.singleshot.drift_step_size,
++                    horizon_gamma=horizon_gamma,
+                 )
+                 # Self-check on logged iterations: pass 2's states should equal pass 1's up to
+                 # bf16 noise (same weights and inputs).
+@@ -2044,7 +2098,8 @@ def fit(
+                 )
+                 drift_field_time = time.perf_counter() - drift_field_t0
+                 drift_loss = drift_surrogate_loss_fn(
+-                    x_live, full_batch_field.V, full_batch_field.S_j, eta=hparams.singleshot.drift_step_size
++                    x_live, full_batch_field.V, full_batch_field.S_j, eta=hparams.singleshot.drift_step_size,
++                    horizon_gamma=horizon_gamma,
+                 )
+                 total_loss = loss + hparams.singleshot.drift_weight * drift_loss
+             elif drift_enabled:
+@@ -2067,6 +2122,7 @@ def fit(
+                     exclude_self_positive=hparams.singleshot.drift_exclude_self_positive,
+                     tie_self_negative=hparams.singleshot.drift_tie_self_negative,
+                     field_scales=field_scales,
++                    horizon_gamma=horizon_gamma,
+                 )
+                 drift_loss = drift_result.loss
+                 if drift_scale_state is not None:
+@@ -2107,7 +2163,7 @@ def fit(
+                 smoothl1_beta_state.observe(
+                     (sl1_x.detach() - sl1_y).abs(), k_toks, hparams.singleshot.smoothl1_beta_quantile
+                 )
+-                smoothl1_result = compute_smoothl1_loss_fn(sl1_x, sl1_y, beta=smoothl1_beta_state.beta)
++                smoothl1_result = compute_smoothl1_loss_fn(sl1_x, sl1_y, beta=smoothl1_beta_state.beta, horizon_gamma=horizon_gamma)
+                 smoothl1_loss = smoothl1_result.loss
+                 smoothl1_accum_tracker.update(smoothl1_result, k_toks)
+                 total_loss = total_loss + hparams.singleshot.smoothl1_weight * smoothl1_loss
+@@ -2396,6 +2452,24 @@ def fit(
+             # log the objective that is actually backpropagated.
+             if drift_enabled and smoothl1_enabled:
+                 metrics["reg/total_loss"] = native_mtp_loss + weighted_drift_loss + weighted_sl1_loss
++            # Horizon-weighted loss (fixedkweightedplan_zh-TW.md): with the switch on, `loss`,
++            # `ce_teach_stud`, drift/loss and sl1/loss above are the horizon-weighted values and
++            # are not comparable with a mean-pooled run. Logged from this iteration's micro-batch
++            # (this rank): the weights in use and, against the hard teacher labels, the CE of each
++            # horizon and its plain mean -- what `loss_rank0` is under mean pooling (without the
++            # prefix term), so it can be compared across runs.
++            if horizon_gamma is not None:
++                metrics["horizon_weight/gamma"] = horizon_gamma
++                for j, w_j in enumerate(mtp_horizon_weights.tolist(), start=1):
++                    metrics[f"horizon_weight/w_h{j}"] = w_j
++                if hparams.singleshot.hard_teacher_supervision:
++                    with torch.no_grad():
++                        ce_per_horizon = F.cross_entropy(
++                            soft_stud_preds.detach().flatten(end_dim=-2), hard_teach_preds.flatten(), reduction="none"
++                        ).float().view(-1, k_toks).mean(dim=0)
++                    for j, ce_j in enumerate(ce_per_horizon.tolist(), start=1):
++                        metrics[f"horizon_weight/ce_h{j}"] = ce_j
++                    metrics["horizon_weight/mtp_loss_unweighted"] = ce_per_horizon.mean().item()
+             # extra metrics block
+             if hparams.singleshot.extra_train_metrics:
+                 metrics.update(stud_forced_teach_loss)
